@@ -1,0 +1,11 @@
+{
+  "name": "opencode-buraunkan-kobo",
+  "version": "0.1.0",
+  "description": "ブラウン管工房 — an opencode plugin workshop: multiple independent plugins in one repo (catalog-bridge / quota-retry / session-reaper), activated per install alias",
+  "main": "index.ts",
+  "dependencies": {
+    "jsonc-parser": "^3.3.1"
+  },
+  "keywords": ["opencode", "opencode-plugin", "plugin-collection"],
+  "license": "MIT"
+}
