@@ -53,6 +53,7 @@ type ReaperConfig = {
   registryPath?: string
   defaultKeepDays?: number
   defaultMaxSessions?: number
+  logKeep?: number
   pipelines?: Record<string, PipelineRule>
 }
 type Entry = { id: string; created: number }
@@ -103,6 +104,40 @@ function loadRegistry(file: string): Registry {
 
 function saveRegistry(file: string, reg: Registry): void {
   atomicWrite(file, JSON.stringify(reg, null, 2))
+}
+
+// 行为日志: jsonl 追加, 保留最近 logKeep 条(默认 100, 0 = 关闭), 与 registry 同目录
+type LogEntry = {
+  ts: number
+  event: "run" | "reap" | "set"
+  pipeline: string
+  sessionID?: string
+  registered?: string
+  expired?: number
+  overflow?: number
+  reaped?: string[]
+  failed?: string[]
+  bucket?: number
+  change?: Record<string, unknown> | "remove"
+}
+
+function appendLog(cfg: ReaperConfig, registryFile: string, entry: LogEntry): void {
+  const keep = cfg.logKeep ?? 100
+  if (keep <= 0) return
+  const file = path.join(path.dirname(registryFile), "log.jsonl")
+  let lines: string[] = []
+  try {
+    lines = readFileSync(file, "utf8").split("\n").filter(Boolean)
+  } catch (err: any) {
+    if (err?.code !== "ENOENT") {
+      console.error(`[session-reaper] log unreadable, resetting: ${file}`, err)
+      try {
+        renameSync(file, `${file}.corrupt-${Date.now()}`)
+      } catch {}
+    }
+  }
+  lines.push(JSON.stringify(entry))
+  atomicWrite(file, lines.slice(-keep).join("\n") + "\n")
 }
 
 async function deleteSession(serverUrl: URL, sessionID: string): Promise<boolean> {
@@ -175,13 +210,13 @@ function ageText(created: number, now: number): string {
   return `${((now - created) / 86400_000).toFixed(1)}d`
 }
 
-// reap 一个 pipeline 的桶; 返回 [删除成功列表, 删除失败列表, 存活列表]
+// reap 一个 pipeline 的桶; 过期与溢出分别列出, 删除成功/失败分开记录
 async function reapBucket(
   serverUrl: URL,
   reg: Registry,
   pipeline: string,
   rule: { keepDays?: number; maxSessions?: number },
-): Promise<{ reaped: Entry[]; failed: Entry[]; survivors: Entry[] }> {
+): Promise<{ expired: Entry[]; overflow: Entry[]; reaped: Entry[]; failed: Entry[]; survivors: Entry[] }> {
   const bucket = [...(reg[pipeline] ?? [])].sort((a, b) => a.created - b.created)
   const now = Date.now()
   const expired = bucket.filter(
@@ -201,7 +236,7 @@ async function reapBucket(
     if (await deleteSession(serverUrl, e.id)) reaped.push(e)
     else failed.push(e)
   }
-  return { reaped, failed, survivors }
+  return { expired, overflow, reaped, failed, survivors }
 }
 
 function statusReport(cfg: ReaperConfig, reg: Registry): string {
@@ -284,7 +319,7 @@ export const sessionReaper = async (input: any) => {
         }
         const rule = effectiveRule(cfg, parsed.pipeline!)
         const reg = loadRegistry(registryFile)
-        const { reaped, failed, survivors } = await reapBucket(serverUrl, reg, parsed.pipeline!, rule)
+        const { expired, overflow, reaped, failed, survivors } = await reapBucket(serverUrl, reg, parsed.pipeline!, rule)
         for (const e of reaped) console.log(`[session-reaper] reaped ${parsed.pipeline} ${e.id}`)
         const now = Date.now()
         const kept = [...survivors, ...failed]
@@ -293,6 +328,18 @@ export const sessionReaper = async (input: any) => {
         kept.push({ id: inp.sessionID, created: now })
         reg[parsed.pipeline!] = kept
         saveRegistry(registryFile, reg)
+        appendLog(cfg, registryFile, {
+          ts: now,
+          event: "run",
+          pipeline: parsed.pipeline!,
+          sessionID: inp.sessionID,
+          registered: inp.sessionID,
+          expired: expired.length,
+          overflow: overflow.length,
+          reaped: reaped.map((e) => e.id),
+          failed: failed.map((e) => e.id),
+          bucket: kept.length,
+        })
         console.log(`[session-reaper] registered ${parsed.pipeline} ${inp.sessionID} (bucket=${kept.length})`)
         // agent 看到的 prompt 与原始完全一致: 剥掉 action/flags, 剩余原样
         const parts = out?.parts
@@ -318,6 +365,13 @@ export const sessionReaper = async (input: any) => {
           if (cfg.pipelines?.[name] !== undefined) {
             delete cfg.pipelines[name]
             saveConfig(cfg)
+            appendLog(cfg, registryFile, {
+              ts: Date.now(),
+              event: "set",
+              pipeline: name,
+              sessionID: inp.sessionID,
+              change: "remove",
+            })
             await replyLocal(inp.sessionID, `[session-reaper] 已删除 ${name} 的显式配置(回落 default*)`)
           } else {
             await replyLocal(inp.sessionID, `[session-reaper] ${name} 无显式配置，无需删除`)
@@ -338,6 +392,16 @@ export const sessionReaper = async (input: any) => {
             ...(parsed.maxSessions !== undefined ? { maxSessions: parsed.maxSessions } : {}),
           }
           saveConfig(cfg)
+          appendLog(cfg, registryFile, {
+            ts: Date.now(),
+            event: "set",
+            pipeline: name,
+            sessionID: inp.sessionID,
+            change: {
+              ...(parsed.keepDays !== undefined ? { keepDays: parsed.keepDays } : {}),
+              ...(parsed.maxSessions !== undefined ? { maxSessions: parsed.maxSessions } : {}),
+            },
+          })
           await replyLocal(
             inp.sessionID,
             `[session-reaper] ${name} 配置已更新: keepDays=${cfg.pipelines[name].keepDays ?? "(未设)"} maxSessions=${cfg.pipelines[name].maxSessions ?? "(未设)"}`,
@@ -358,9 +422,20 @@ export const sessionReaper = async (input: any) => {
         }
         const rule = effectiveRule(cfg, parsed.pipeline!)
         const reg = loadRegistry(registryFile)
-        const { reaped, failed, survivors } = await reapBucket(serverUrl, reg, parsed.pipeline!, rule)
+        const { expired, overflow, reaped, failed, survivors } = await reapBucket(serverUrl, reg, parsed.pipeline!, rule)
         reg[parsed.pipeline!] = [...survivors, ...failed]
         saveRegistry(registryFile, reg)
+        appendLog(cfg, registryFile, {
+          ts: Date.now(),
+          event: "reap",
+          pipeline: parsed.pipeline!,
+          sessionID: inp.sessionID,
+          expired: expired.length,
+          overflow: overflow.length,
+          reaped: reaped.map((e) => e.id),
+          failed: failed.map((e) => e.id),
+          bucket: survivors.length + failed.length,
+        })
         const lines = [`[session-reaper] reap ${parsed.pipeline}: 删除 ${reaped.length}, 失败 ${failed.length}, 存活 ${survivors.length}`]
         for (const e of reaped) lines.push(`  已删除 ${e.id} (${ageText(e.created, Date.now())})`)
         for (const e of failed) lines.push(`  删除失败(保留重试) ${e.id}`)

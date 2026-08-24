@@ -175,6 +175,22 @@ session + 数十个 subagent 子会话，无人治理时 opencode.db 无限膨�
 删除走 `DELETE /session/:id`，级联删除全部 subagent 子会话；404 视为已清理。
 `set` 后文件被程序重写为纯 JSON（注释归程序管）。
 
+### 行为日志
+
+每次 `run` / `reap` / `set` 追加一条 JSONL 到 registry 同目录的 `log.jsonl`
+（默认 `~/.local/state/opencode/session-reaper/log.jsonl`），保留最近
+`logKeep` 条（默认 100，设 0 关闭）：
+
+```jsonc
+{"ts":1735036800000,"event":"run","pipeline":"twitter-daily","sessionID":"ses_c","registered":"ses_c","expired":1,"overflow":0,"reaped":["ses_a"],"failed":[],"bucket":2}
+{"ts":1735036900000,"event":"reap","pipeline":"twitter-daily","sessionID":"ses_d","expired":0,"overflow":1,"reaped":["ses_b"],"failed":[],"bucket":1}
+{"ts":1735037000000,"event":"set","pipeline":"twitter-daily","sessionID":"ses_d","change":{"maxSessions":2}}
+```
+
+字段：`registered` 本次新增的 sessionID、`expired`/`overflow` 过期与超出数量、
+`reaped` 删除成功的 ID 列表、`failed` 删除失败（留桶重试）的 ID 列表、
+`bucket` 操作后的桶内总数。
+
 调用示例（OpenChamber schedule 的 prompt 字段或 TUI）：
 
 ```

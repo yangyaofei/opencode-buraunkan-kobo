@@ -199,6 +199,23 @@ are registered but never reaped (safe default). Deletion goes through
 already clean. After a `set` the file is rewritten as plain JSON (comments
 are owned by the program).
 
+### Activity log
+
+Every `run` / `reap` / `set` appends one JSONL line to `log.jsonl` next to
+the registry (default `~/.local/state/opencode/session-reaper/log.jsonl`),
+keeping the most recent `logKeep` lines (default 100, 0 disables):
+
+```jsonc
+{"ts":1735036800000,"event":"run","pipeline":"twitter-daily","sessionID":"ses_c","registered":"ses_c","expired":1,"overflow":0,"reaped":["ses_a"],"failed":[],"bucket":2}
+{"ts":1735036900000,"event":"reap","pipeline":"twitter-daily","sessionID":"ses_d","expired":0,"overflow":1,"reaped":["ses_b"],"failed":[],"bucket":1}
+{"ts":1735037000000,"event":"set","pipeline":"twitter-daily","sessionID":"ses_d","change":{"maxSessions":2}}
+```
+
+Fields: `registered` = the sessionID added this run, `expired`/`overflow` =
+counts past keepDays / beyond maxSessions, `reaped` = IDs deleted
+successfully, `failed` = IDs whose deletion failed (kept for retry),
+`bucket` = bucket size after the operation.
+
 Example (OpenChamber schedule prompt field or TUI):
 
 ```
