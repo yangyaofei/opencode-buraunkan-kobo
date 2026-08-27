@@ -23,6 +23,13 @@
 //   比对远端 HEAD(10s 超时); 有新提交则删除自己的 wrapper, 重启后 opencode 原生补装
 //   (即: 发布新版本后重启两次)。sync.enabled: false 可关闭; 钉死 commit 的安装不自动更新。
 //
+// on-demand 虚模型(可选, 配置 onDemandModels):
+//   在 provider 下注册一个"调度"模型(如 glm-5.3-flash-on-demand), 请求按 chain 顺序
+//   改写 body.model 转发到真实模型; 配额耗尽 429 自动降级到下一个(跨 provider 时
+//   换 baseURL + key)。整链耗尽返回裸 429(不注入等待), opencode 原生重试(补丁后
+//   无限+30s 封顶)每 ~30s 重扫整链, 哪个先恢复用哪个。
+//   存量模型不经此路径, 触发方式完全不变。
+//
 // 闭包边界(不改什么):
 //   - 不碰重试次数上限(插件够不到 Effect 调度层), 上游 issue:
 //     https://github.com/anomalyco/opencode/issues/43596
@@ -45,6 +52,7 @@ import {
   writeFileSync,
 } from "node:fs"
 import path from "node:path"
+import os from "node:os"
 import { loadJsonc } from "../shared/jsonc"
 import { replyLocal } from "../shared/reply"
 import { cacheDir, configDir, dataDir } from "../shared/paths"
@@ -69,8 +77,21 @@ type PatchConfig = {
   restore?: boolean
 }
 
+type OnDemandChainEntry = {
+  provider?: string // 缺省 = 虚模型挂载的 provider
+  model: string // 该跳的真实 model id(写入 body.model)
+}
+
+type OnDemandModel = {
+  model: string // 虚模型 ID(TUI 模型列表里出现)
+  provider: string // 挂载的 opencode providerID
+  name?: string // TUI 显示名
+  chain: OnDemandChainEntry[]
+}
+
 type PluginConfig = {
-  providers: ProviderConfig[]
+  providers?: ProviderConfig[]
+  onDemandModels?: OnDemandModel[]
   quotaCacheMs?: number
   patch?: PatchConfig
 }
@@ -135,6 +156,68 @@ function extractBearerFromInit(init?: Parameters<typeof fetch>[1]): string | und
     if (String(k).toLowerCase() === "authorization") return matchBearer(String(v))
   }
   return undefined
+}
+
+// ===== on-demand 虚模型: 公共辅助 =====
+
+// models.dev 缓存(与 catalog-bridge 同源): 跨 provider 转发的 baseURL 兜底 + 虚模型元数据复制
+const CATALOG_PATHS = [
+  path.join(os.homedir(), ".cache", "opencode", "models.json"),
+  path.join(os.homedir(), "Library", "Caches", "opencode", "models.json"),
+]
+
+const catalogCache = (() => {
+  for (const p of CATALOG_PATHS) {
+    try {
+      if (!existsSync(p)) continue
+      return JSON.parse(readFileSync(p, "utf8")) as any
+    } catch {}
+  }
+  return null
+})()
+
+// 跨 provider 转发目标 baseURL: 用户 config 优先, 其次 models.dev 缓存
+function providerBaseURL(cfg: any, providerID: string): string | undefined {
+  const fromCfg = cfg?.provider?.[providerID]?.options?.baseURL
+  if (typeof fromCfg === "string" && fromCfg) return fromCfg
+  const fromCatalog = catalogCache?.[providerID]?.api
+  return typeof fromCatalog === "string" && fromCatalog ? fromCatalog : undefined
+}
+
+// 跨 provider 的 API key: config options.apiKey 优先, 其次 auth.json
+function providerApiKey(cfg: any, providerID: string): string | undefined {
+  const fromCfg = cfg?.provider?.[providerID]?.options?.apiKey
+  if (typeof fromCfg === "string" && fromCfg) return fromCfg
+  return readApiKey(providerID)
+}
+
+function parseBodyJson(body: unknown): Record<string, any> | null {
+  if (typeof body !== "string") return null
+  try {
+    const parsed = JSON.parse(body)
+    return parsed && typeof parsed === "object" ? parsed : null
+  } catch {
+    return null
+  }
+}
+
+function rebuildResponse(res: Response, text: string): Response {
+  return new Response(text, { status: res.status, statusText: res.statusText, headers: Object.fromEntries(res.headers) })
+}
+
+// 虚模型的 TUI 定义: 元数据复制自 chain 首目标(models.dev catalog 条目)
+function buildVirtualModelDef(e: OnDemandModel): Record<string, any> {
+  const first = e.chain[0]
+  const meta = catalogCache?.[first.provider ?? e.provider]?.models?.[first.model]
+  const def: Record<string, any> = { name: e.name ?? `${first.model} (on-demand)` }
+  if (meta && typeof meta === "object") {
+    if (meta.limit?.context) def.limit = { ...meta.limit }
+    if (meta.cost) def.cost = { ...meta.cost }
+    for (const k of ["reasoning", "tool_call", "attachment", "temperature", "modalities"]) {
+      if (meta[k] !== undefined) def[k] = meta[k]
+    }
+  }
+  return def
 }
 
 
@@ -634,6 +717,18 @@ function patchStatusReport(projectDir: string, binsOverride?: string[]): string 
     lines.push("providers(429 拦截): 未配置")
   }
 
+  const onDemandList = cfg.onDemandModels ?? []
+  if (onDemandList.length) {
+    lines.push("on-demand 模型(配额 429 自动降级):")
+    for (const e of onDemandList) {
+      if (!e?.model || !e.provider) continue
+      const chain = (e.chain ?? []).map((h) => `${h.provider ?? e.provider}/${h.model}`).join(" → ")
+      lines.push(`  - ${e.model} @ ${e.provider}: ${chain || "(空链)"}`)
+    }
+  } else {
+    lines.push("on-demand 模型: 未配置")
+  }
+
   const enabled = patch.enabled === true || patch.restore === true
   lines.push(`patch 配置: ${enabled ? describePatchConfig(patch) : "未启用"}`)
   let active = false
@@ -839,6 +934,85 @@ export const quotaRetry = async (input: { directory?: string; client?: any }) =>
     }
   }
 
+  // on-demand 虚模型 fetch: 命中虚 model → 按 chain 顺序改写转发; 未命中 → 存量路径(配额拦截/透传)
+  function makeOnDemandFetch(
+    entries: OnDemandModel[],
+    quotaFetch: ((url: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => Promise<Response>) | undefined,
+    cfg: any,
+  ) {
+    const virtualById = new Map(entries.map((e) => [e.model, e]))
+    const toastAt = new Map<string, number>()
+    const throttled = (key: string, title: string, message: string) => {
+      if (Date.now() - (toastAt.get(key) ?? 0) < 300_000) return
+      toastAt.set(key, Date.now())
+      toast(title, message, "info")
+    }
+    const quotaMatchFor = (providerID: string): RegExp => {
+      const p = (pluginConfig.providers ?? []).find((x) => x && x.id === providerID)
+      return new RegExp(p?.quotaMatch ?? DEFAULT_QUOTA_MATCH, "i")
+    }
+
+    return async (url: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+      const bodyJson = parseBodyJson(init?.body)
+      const entry = bodyJson ? virtualById.get(String(bodyJson.model)) : undefined
+      if (!entry) return quotaFetch ? quotaFetch(url, init) : fetch(url, init)
+
+      let last429: Response | undefined
+      let prevQuotaExhausted = false
+      for (const hop of entry.chain) {
+        const targetProvider = hop.provider ?? entry.provider
+        const cross = targetProvider !== entry.provider
+        let targetUrl = String(url)
+        if (cross) {
+          const base = providerBaseURL(cfg, targetProvider)
+          const suffix = new URL(targetUrl).pathname.match(/\/(chat\/completions|chat-completions|completions|embeddings|responses)$/)
+          if (!base || !suffix) {
+            throttled(`skip:${targetProvider}`, entry.model, `${targetProvider} 的转发地址不可解析, 跳过该降级目标`)
+            continue
+          }
+          targetUrl = `${base.replace(/\/+$/, "")}${suffix[0]}`
+        }
+        const headers = new Headers(init?.headers)
+        headers.delete("content-length") // body.model 改写后长度变化, 让 fetch 重算
+        if (cross) {
+          const key = providerApiKey(cfg, targetProvider)
+          if (!key) {
+            throttled(`nokey:${targetProvider}`, entry.model, `未找到 ${targetProvider} 的 API key, 跳过该降级目标`)
+            continue
+          }
+          headers.set("authorization", `Bearer ${key}`)
+        }
+        const res = await fetch(targetUrl, { ...init, headers, body: JSON.stringify({ ...bodyJson, model: hop.model }) })
+        if (res.status !== 429) {
+          // 前一跳配额耗尽、本跳成功: 降级生效(付费 API 场景用户必须知情)
+          if (prevQuotaExhausted) {
+            throttled(
+              `downgraded:${entry.model}:${targetProvider}`,
+              `${entry.model} 已降级`,
+              `当前走 ${targetProvider}/${hop.model}(${targetProvider === entry.provider ? "同 provider" : "跨 provider"}备用)`,
+            )
+          }
+          return res
+        }
+        const text = await res.text()
+        if (!quotaMatchFor(targetProvider).test(text)) {
+          // 非配额 429(并发限流等): 不烧链, 原样交还 opencode 原生重试
+          return rebuildResponse(res, text)
+        }
+        last429 = rebuildResponse(res, text)
+        prevQuotaExhausted = true
+      }
+      if (last429) {
+        throttled(`exhausted:${entry.model}`, `${entry.model} 整链配额耗尽`, "返回 429, 原生重试将每 ~30s 重扫整链, 恢复即用")
+        return last429
+      }
+      return new Response(
+        JSON.stringify({ error: { message: "on-demand chain 未产生响应(检查 chain 配置)", type: "on_demand_config" } }),
+        { status: 502, headers: { "content-type": "application/json" } },
+      )
+    }
+  }
+
   return {
     config: (cfg: any) => {
       // /retry-setting 命令: 实际由 command.execute.before 本地处理(零模型调用);
@@ -849,14 +1023,43 @@ export const quotaRetry = async (input: { directory?: string; client?: any }) =>
         template:
           "调用 quota_retry_status 工具获取状态报告, 将其输出完整原样呈现给用户(保留所有小节与对照结论)。不要省略, 不要改写数字, 不要自行推测。",
       }
-      if (!pluginConfig.providers || pluginConfig.providers.length === 0) return
+      const onDemand = (pluginConfig.onDemandModels ?? []).filter(
+        (e) =>
+          e &&
+          e.model &&
+          e.provider &&
+          Array.isArray(e.chain) &&
+          e.chain.length > 0 &&
+          e.chain.every((h) => h && typeof h.model === "string" && h.model),
+      )
+      const providerIds = new Set<string>()
+      for (const p of pluginConfig.providers ?? []) if (p && p.id) providerIds.add(p.id)
+      for (const e of onDemand) providerIds.add(e.provider)
+      if (providerIds.size === 0) return
       cfg.provider = cfg.provider ?? {}
-      for (const p of pluginConfig.providers) {
-        if (!p || !p.id) continue
-        const existing = cfg.provider[p.id] ?? {}
-        cfg.provider[p.id] = {
+      const onDemandByProvider = new Map<string, OnDemandModel[]>()
+      for (const e of onDemand) {
+        const list = onDemandByProvider.get(e.provider) ?? []
+        list.push(e)
+        onDemandByProvider.set(e.provider, list)
+      }
+      for (const id of providerIds) {
+        const existing = cfg.provider[id] ?? {}
+        const quotaP = (pluginConfig.providers ?? []).find((p) => p && p.id === id)
+        const odEntries = onDemandByProvider.get(id) ?? []
+        const fetchFn = odEntries.length
+          ? makeOnDemandFetch(odEntries, quotaP ? makeFetch(quotaP) : undefined, cfg)
+          : makeFetch(quotaP!)
+        // 注册虚模型(用户未手写同名模型时); 元数据复制自 chain 首目标的 catalog 条目
+        let models = existing.models
+        if (odEntries.length) {
+          models = { ...(models ?? {}) }
+          for (const e of odEntries) if (!models[e.model]) models[e.model] = buildVirtualModelDef(e)
+        }
+        cfg.provider[id] = {
           ...existing,
-          options: { ...(existing.options ?? {}), fetch: makeFetch(p) },
+          ...(models ? { models } : {}),
+          options: { ...(existing.options ?? {}), fetch: fetchFn },
         }
       }
     },
