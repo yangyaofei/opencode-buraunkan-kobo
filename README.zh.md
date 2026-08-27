@@ -10,7 +10,8 @@ Kenkyujo）的一楼——让未来道具 8 号机「电话微波炉（暂定）
 
 1. **quota-retry** —— 拦截配额耗尽的 429，注入精确的 `retry-after-ms`，让
    opencode 在限额重置后再重试，而不是原生退避约 70 秒后放弃；可选二进制补丁
-   把硬编码的重试上限变为可配置。
+   把硬编码的重试上限变为可配置。另支持 **on-demand 虚模型**：配额耗尽时不死等，
+   自动按链降级到其他 provider/模型——见 [on-demand 虚模型](#on-demand-虚模型可选)。
 2. **session-reaper** —— pipeline session 治理。`/session-reaper run` 声明
    会话身份并逐字透传 prompt，下次运行时自动清理超期 session（级联删除全部
    subagent 子会话）。
@@ -39,6 +40,10 @@ Kenkyujo）的一楼——让未来道具 8 号机「电话微波炉（暂定）
 
 opencode 1.18.12 起把重试次数上限固定为 5。coding plan 配额耗尽后，5 次重试只
 覆盖约 70 秒，会话直接中断——但错误信息里已经写明配额几小时后才重置。
+
+无人值守任务等重置没问题；但有时需要"现在就跑完"。这时可以用本插件注册的
+*on-demand 虚模型*：配额耗尽自动按链降级到下一个 provider/模型——配置见
+[on-demand 虚模型](#on-demand-虚模型可选)。
 
 ### 工作原理
 

@@ -11,7 +11,9 @@ Laboratory (Mirai Gadget Kenkyujo) — the Lifter that makes Mirai Gadget
 1. **quota-retry** — intercepts quota-exhausted 429s and injects an exact
    `retry-after-ms`, so opencode retries after the quota resets instead of
    giving up after ~70s of native backoff. Optional binary patch makes the
-   hardcoded retry limits configurable.
+   hardcoded retry limits configurable. It also supports **on-demand virtual
+   models** that fall through to other providers/models when a quota runs
+   out instead of waiting — see [On-demand virtual models](#on-demand-virtual-models-optional).
 2. **session-reaper** — pipeline session governance: `/session-reaper run`
    claims the session for a pipeline, passes the prompt through verbatim,
    and reaps expired sessions (cascading to all subagent children) on the
@@ -45,6 +47,11 @@ separate and can be enabled/disabled/pinned individually.
 Since 1.18.12 opencode hardcodes the retry limit at 5. When a coding-plan
 quota is exhausted, 5 retries cover only ~70 seconds and the session aborts
 — even though the error body already says the quota resets hours later.
+
+Waiting is fine for unattended runs, but sometimes you need the task to
+finish now. For that case this plugin can register *on-demand virtual
+models* that automatically fall through to another provider/model on quota
+exhaustion — see [On-demand virtual models](#on-demand-virtual-models-optional).
 
 ### How it works
 
