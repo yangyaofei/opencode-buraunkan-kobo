@@ -108,18 +108,12 @@ opencode 按响应头决定等待时间：`retry-after-ms` > `retry-after` > 指
 配额耗尽 429 自动降级到下一个--适合"现在就要跑完"的场景（付费 API 顶上）；
 而能接受等配额的夜间任务继续选原模型，触发方式不变。
 
-挂载到**专用的自定义 provider**（在 opencode 自己的 config 里定义 `npm` +
-`options.baseURL`），模型 ID 与真实模型同名，catalog-bridge 可直接桥接元数据：
-
-```jsonc
-// opencode.jsonc
-"fallback-providers": {
-  "npm": "@ai-sdk/openai-compatible",
-  "name": "Fallback",
-  "options": { "baseURL": "https://open.bigmodel.cn/api/coding/paas/v4" },  // chain[0] 的端点
-  "models": { "glm-5.3-flash": { "name": "GLM-5.3-Flash (Fallback)" } }
-}
-```
+挂载组**不需要在 opencode 自己的 config 里定义**：`provider` 不存在时，
+quota-retry 会在 config hook 里自动创建——`npm` 默认 `@ai-sdk/openai-compatible`，
+`baseURL` + `apiKey` 从链首跳目标继承（config `options` 优先，其次 auth.json），
+即使插件拦截失效，裸请求也带有效鉴权。可选逐条目覆盖：`providerName`
+（分组显示名）、`npm`。需要完全手工控制时才在 opencode.jsonc 手写该组——
+用户已写的组不会被覆盖。模型 ID 与真实模型同名，catalog-bridge 可直接桥接元数据：
 
 ```jsonc
 // ~/.config/opencode/quota-retry.jsonc
@@ -128,8 +122,9 @@ opencode 按响应头决定等待时间：`retry-after-ms` > `retry-after` > 指
   "onDemandModels": [
     {
       "model": "glm-5.3-flash",              // 与真实模型同名
-      "provider": "fallback-providers",      // 专用挂载组
+      "provider": "fallback-providers",      // 自动创建的组, 无需 opencode.jsonc
       "name": "GLM-5.3-Flash (Fallback)",
+      "providerName": "Fallback",            // 可选: 覆盖分组显示名
       "chain": [
         { "provider": "zhipuai-coding-plan", "model": "glm-5.3-flash" },  // 订阅额度
         { "provider": "zhipuai", "model": "glm-5.3-flash" }               // 付费 API
@@ -148,8 +143,8 @@ opencode 按响应头决定等待时间：`retry-after-ms` > `retry-after` > 指
 - 整链耗尽 -> 返回裸 429（不注入等待）；配合二进制补丁，原生重试每 ~30s
   重扫整链，哪个模型先恢复配额就用哪个。
 - 不在链里的模型行为与之前完全一致（配额 429 -> 注入 `retry-after-ms` 等重置）。
-- TUI 元数据（limit 等）从 chain 首目标的 models.dev catalog 条目复制；
-  挂载 provider 的 baseURL 解析不到时不注册并 toast 提示（防手滑）。
+- TUI 元数据（limit 等）从 chain 首目标的 models.dev catalog 条目复制。
+- 挂载组缺失时自动创建；链首跳在任何地方都解析不到的条目跳过注册并 toast 警告。
 
 ### 二进制补丁（可选）
 

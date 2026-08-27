@@ -86,6 +86,8 @@ type OnDemandModel = {
   model: string // 虚模型 ID(TUI 模型列表里出现)
   provider: string // 挂载的 opencode providerID
   name?: string // TUI 显示名
+  npm?: string // 自动创建挂载组时用的 SDK 包, 默认 @ai-sdk/openai-compatible
+  providerName?: string // 自动创建挂载组时的分组显示名, 默认用 provider id
   chain: OnDemandChainEntry[]
 }
 
@@ -1043,6 +1045,27 @@ export const quotaRetry = async (input: { directory?: string; client?: any }) =>
         list.push(e)
         onDemandByProvider.set(e.provider, list)
       }
+      // 挂载组不存在时自动创建(opencode.jsonc 无需手写): baseURL/apiKey 取
+      // 链首跳目标的解析结果(config options 优先, 内置 provider 走 auth.json),
+      // 即使插件拦截失效, 裸请求也是带鉴权的有效请求(优雅降级)。
+      // 用户已手写的挂载组不覆盖; 取第一个链首跳可解析的条目作为种子。
+      const hop0 = (e: OnDemandModel) => e.chain[0].provider ?? e.provider
+      for (const [mountId, list] of onDemandByProvider) {
+        if (cfg.provider[mountId]) continue
+        const seed = list.find((e) => {
+          const src = hop0(e)
+          return src !== mountId && !!providerBaseURL(cfg, src)
+        })
+        if (!seed) continue
+        const src = hop0(seed)
+        const key = providerApiKey(cfg, src)
+        cfg.provider[mountId] = {
+          npm: seed.npm ?? "@ai-sdk/openai-compatible",
+          name: seed.providerName ?? mountId,
+          options: { baseURL: providerBaseURL(cfg, src), ...(key ? { apiKey: key } : {}) },
+          models: {},
+        }
+      }
       for (const id of providerIds) {
         const existing = cfg.provider[id] ?? {}
         const quotaP = (pluginConfig.providers ?? []).find((p) => p && p.id === id)
@@ -1050,18 +1073,19 @@ export const quotaRetry = async (input: { directory?: string; client?: any }) =>
         const fetchFn = odEntries.length
           ? makeOnDemandFetch(odEntries, quotaP ? makeFetch(quotaP) : undefined, cfg)
           : makeFetch(quotaP!)
-        // 注册虚模型(用户未手写同名模型时); 元数据复制自 chain 首目标的 catalog 条目。
-        // 挂载 provider 的 baseURL 解析不到(不在 config 也无内置定义)时不注册--
-        // 无 baseURL 的 provider 在 opencode 里本来就不可用, 注册只会造出坏分组
+        // 注册虚模型(用户未手写同名模型时); 元数据复制自 chain 首目标的 catalog 条目
         let models = existing.models
         if (odEntries.length) {
           if (!providerBaseURL(cfg, id)) {
-            toast("quota-retry on-demand", `${id} 无法解析 baseURL, 虚模型不注册(需在 opencode config 里定义该 provider)`, "warning")
+            toast("quota-retry on-demand", `${id} 无法解析 baseURL 且自动创建失败(链首跳目标也不可解析), 虚模型不注册`, "warning")
           } else {
             models = { ...(models ?? {}) }
             for (const e of odEntries) if (!models[e.model]) models[e.model] = buildVirtualModelDef(e)
           }
         }
+        // 自动创建失败(用户也没手写过该组, 链首跳不可解析)时整组不写配置--
+        // 往 opencode 里塞一个缺 baseURL 的坏 provider 只会产生无效分组
+        if (!providerBaseURL(cfg, id) && Object.keys(existing).length === 0) continue
         cfg.provider[id] = {
           ...existing,
           ...(models ? { models } : {}),

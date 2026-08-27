@@ -123,19 +123,15 @@ quota-exhausted 429s - useful when "finish now on the paid API" beats "wait for
 the subscription quota to reset" (e.g. overnight runs keep waiting, interactive
 runs switch models).
 
-Mount it under a **dedicated custom provider** (defined in opencode's own
-config with `npm` + `options.baseURL`), and use the same model ID as the real
-model so catalog-bridge can bridge metadata:
-
-```jsonc
-// opencode.jsonc
-"fallback-providers": {
-  "npm": "@ai-sdk/openai-compatible",
-  "name": "Fallback",
-  "options": { "baseURL": "https://open.bigmodel.cn/api/coding/paas/v4" },  // chain[0]'s endpoint
-  "models": { "glm-5.3-flash": { "name": "GLM-5.3-Flash (Fallback)" } }
-}
-```
+The mount group needs **no entry in opencode's own config**: if `provider`
+does not exist yet, quota-retry creates it automatically in the config hook -
+`npm` defaults to `@ai-sdk/openai-compatible`, and `baseURL` + `apiKey` are
+inherited from the chain's first hop (config `options`, then auth.json), so
+even un-intercepted raw requests carry valid auth. Optional per-entry
+overrides: `providerName` (group display name) and `npm`. Define the group by
+hand in opencode.jsonc only for full manual control - user-written groups are
+never overwritten. Use the same model ID as the real model so catalog-bridge
+can bridge metadata:
 
 ```jsonc
 // ~/.config/opencode/quota-retry.jsonc
@@ -144,8 +140,9 @@ model so catalog-bridge can bridge metadata:
   "onDemandModels": [
     {
       "model": "glm-5.3-flash",              // same ID as the real model
-      "provider": "fallback-providers",      // the dedicated mount group
+      "provider": "fallback-providers",      // auto-created group, no opencode.jsonc needed
       "name": "GLM-5.3-Flash (Fallback)",
+      "providerName": "Fallback",            // optional: group display name override
       "chain": [
         { "provider": "zhipuai-coding-plan", "model": "glm-5.3-flash" },  // subscription quota
         { "provider": "zhipuai", "model": "glm-5.3-flash" }               // paid API
@@ -169,8 +166,9 @@ Behavior:
 - Models not listed in a chain behave exactly as before (quota 429 -> injected
   `retry-after-ms` -> wait for reset).
 - TUI metadata (limits etc.) is copied from the chain's first target via the
-  models.dev catalog; mounting on an unresolvable provider is skipped with a
-  toast (guard against typos).
+  models.dev catalog.
+- The mount group is auto-created when missing; entries whose chain first hop
+  cannot be resolved anywhere are skipped with a warning toast.
 
 ### Binary patch (optional)
 
