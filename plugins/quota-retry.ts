@@ -1050,11 +1050,17 @@ export const quotaRetry = async (input: { directory?: string; client?: any }) =>
         const fetchFn = odEntries.length
           ? makeOnDemandFetch(odEntries, quotaP ? makeFetch(quotaP) : undefined, cfg)
           : makeFetch(quotaP!)
-        // 注册虚模型(用户未手写同名模型时); 元数据复制自 chain 首目标的 catalog 条目
+        // 注册虚模型(用户未手写同名模型时); 元数据复制自 chain 首目标的 catalog 条目。
+        // 挂载 provider 的 baseURL 解析不到(不在 config 也无内置定义)时不注册--
+        // 无 baseURL 的 provider 在 opencode 里本来就不可用, 注册只会造出坏分组
         let models = existing.models
         if (odEntries.length) {
-          models = { ...(models ?? {}) }
-          for (const e of odEntries) if (!models[e.model]) models[e.model] = buildVirtualModelDef(e)
+          if (!providerBaseURL(cfg, id)) {
+            toast("quota-retry on-demand", `${id} 无法解析 baseURL, 虚模型不注册(需在 opencode config 里定义该 provider)`, "warning")
+          } else {
+            models = { ...(models ?? {}) }
+            for (const e of odEntries) if (!models[e.model]) models[e.model] = buildVirtualModelDef(e)
+          }
         }
         cfg.provider[id] = {
           ...existing,

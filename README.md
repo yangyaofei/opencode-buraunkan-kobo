@@ -112,21 +112,36 @@ opencode after changing the config.
 
 Existing models are never touched. You can additionally register a *scheduler*
 model that tries a chain of real models in order and falls through on
-quota-exhausted 429s — useful when "finish now on the paid API" beats "wait for
+quota-exhausted 429s - useful when "finish now on the paid API" beats "wait for
 the subscription quota to reset" (e.g. overnight runs keep waiting, interactive
-runs switch models):
+runs switch models).
+
+Mount it under a **dedicated custom provider** (defined in opencode's own
+config with `npm` + `options.baseURL`), and use the same model ID as the real
+model so catalog-bridge can bridge metadata:
 
 ```jsonc
+// opencode.jsonc
+"fallback-providers": {
+  "npm": "@ai-sdk/openai-compatible",
+  "name": "Fallback",
+  "options": { "baseURL": "https://open.bigmodel.cn/api/coding/paas/v4" },  // chain[0]'s endpoint
+  "models": { "glm-5.3-flash": { "name": "GLM-5.3-Flash (Fallback)" } }
+}
+```
+
+```jsonc
+// ~/.config/opencode/quota-retry.jsonc
 {
   "providers": [ /* unchanged */ ],
   "onDemandModels": [
     {
-      "model": "glm-5.3-flash-on-demand",        // virtual model ID shown in the TUI
-      "provider": "zhipuai-coding-plan",          // provider it is listed under
-      "name": "GLM 5.3 Flash (on-demand)",
+      "model": "glm-5.3-flash",              // same ID as the real model
+      "provider": "fallback-providers",      // the dedicated mount group
+      "name": "GLM-5.3-Flash (Fallback)",
       "chain": [
-        { "model": "glm-5.3-flash" },             // subscription quota first (same provider)
-        { "provider": "zhipuai", "model": "glm-5.3-flash" }  // paid API fallback
+        { "provider": "zhipuai-coding-plan", "model": "glm-5.3-flash" },  // subscription quota
+        { "provider": "zhipuai", "model": "glm-5.3-flash" }               // paid API
       ]
     }
   ]
@@ -136,18 +151,19 @@ runs switch models):
 Behavior:
 
 - Selecting the virtual model rewrites `body.model` per chain hop and forwards
-  in order; the first non-429 response wins.
-- Cross-provider hops redirect to the target provider's baseURL and swap the
-  Authorization key (config `options.apiKey`, then auth.json).
-- Non-quota 429s (concurrency limits) do not burn the chain — passed through
+  in order; the first non-429 response wins. Every hop redirects to the target
+  provider's baseURL and swaps the Authorization key (config `options.apiKey`,
+  then auth.json).
+- Non-quota 429s (concurrency limits) do not burn the chain - passed through
   to opencode's native retry.
-- Whole chain exhausted → returns the bare 429 (no injected wait); with the
+- Whole chain exhausted -> returns the bare 429 (no injected wait); with the
   binary patch, native retry rescans the chain every ~30s and picks up
   whichever model recovers first.
-- Models not listed in a chain behave exactly as before (quota 429 → injected
-  `retry-after-ms` → wait for reset).
+- Models not listed in a chain behave exactly as before (quota 429 -> injected
+  `retry-after-ms` -> wait for reset).
 - TUI metadata (limits etc.) is copied from the chain's first target via the
-  models.dev catalog.
+  models.dev catalog; mounting on an unresolvable provider is skipped with a
+  toast (guard against typos).
 
 ### Binary patch (optional)
 

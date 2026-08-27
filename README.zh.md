@@ -100,20 +100,34 @@ opencode 按响应头决定等待时间：`retry-after-ms` > `retry-after` > 指
 ### on-demand 虚模型（可选）
 
 存量模型完全不动。可以额外注册一个"调度"模型：按 chain 顺序依次尝试真实模型，
-配额耗尽 429 自动降级到下一个——适合"现在就要跑完"的场景（付费 API 顶上）；
-而能接受等配额的夜间任务继续选原模型，触发方式不变：
+配额耗尽 429 自动降级到下一个--适合"现在就要跑完"的场景（付费 API 顶上）；
+而能接受等配额的夜间任务继续选原模型，触发方式不变。
+
+挂载到**专用的自定义 provider**（在 opencode 自己的 config 里定义 `npm` +
+`options.baseURL`），模型 ID 与真实模型同名，catalog-bridge 可直接桥接元数据：
 
 ```jsonc
+// opencode.jsonc
+"fallback-providers": {
+  "npm": "@ai-sdk/openai-compatible",
+  "name": "Fallback",
+  "options": { "baseURL": "https://open.bigmodel.cn/api/coding/paas/v4" },  // chain[0] 的端点
+  "models": { "glm-5.3-flash": { "name": "GLM-5.3-Flash (Fallback)" } }
+}
+```
+
+```jsonc
+// ~/.config/opencode/quota-retry.jsonc
 {
   "providers": [ /* 原有配置, 不变 */ ],
   "onDemandModels": [
     {
-      "model": "glm-5.3-flash-on-demand",        // 虚模型 ID, TUI 里出现
-      "provider": "zhipuai-coding-plan",          // 挂载的 provider
-      "name": "GLM 5.3 Flash (按需降级)",
+      "model": "glm-5.3-flash",              // 与真实模型同名
+      "provider": "fallback-providers",      // 专用挂载组
+      "name": "GLM-5.3-Flash (Fallback)",
       "chain": [
-        { "model": "glm-5.3-flash" },             // 先用订阅额度(同 provider)
-        { "provider": "zhipuai", "model": "glm-5.3-flash" }  // 配额尽→付费 API
+        { "provider": "zhipuai-coding-plan", "model": "glm-5.3-flash" },  // 订阅额度
+        { "provider": "zhipuai", "model": "glm-5.3-flash" }               // 付费 API
       ]
     }
   ]
@@ -123,13 +137,14 @@ opencode 按响应头决定等待时间：`retry-after-ms` > `retry-after` > 指
 行为：
 
 - 选中虚模型时，按 chain 逐跳改写 `body.model` 转发；第一个非 429 响应即返回。
-- 跨 provider 跳转重定向到目标 provider 的 baseURL，并换 Authorization key
+  每跳都重定向到目标 provider 的 baseURL，并换 Authorization key
   （config `options.apiKey` 优先，其次 auth.json）。
 - 非配额 429（并发限流）不烧链，原样交还 opencode 原生重试。
-- 整链耗尽 → 返回裸 429（不注入等待）；配合二进制补丁，原生重试每 ~30s
+- 整链耗尽 -> 返回裸 429（不注入等待）；配合二进制补丁，原生重试每 ~30s
   重扫整链，哪个模型先恢复配额就用哪个。
-- 不在链里的模型行为与之前完全一致（配额 429 → 注入 `retry-after-ms` 等重置）。
-- TUI 元数据（limit 等）从 chain 首目标的 models.dev catalog 条目复制。
+- 不在链里的模型行为与之前完全一致（配额 429 -> 注入 `retry-after-ms` 等重置）。
+- TUI 元数据（limit 等）从 chain 首目标的 models.dev catalog 条目复制；
+  挂载 provider 的 baseURL 解析不到时不注册并 toast 提示（防手滑）。
 
 ### 二进制补丁（可选）
 
