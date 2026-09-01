@@ -18,6 +18,7 @@ import { readFileSync, existsSync } from "node:fs"
 import path from "node:path"
 import { cacheDir } from "../shared/paths"
 import { gateActive } from "../shared/gate"
+import { maybeSync } from "../shared/sync"
 
 // models.dev 缓存路径(opencode models-dev.ts 默认落在 cache/opencode/models.json)
 const MODELS_JSON_PATHS = [path.join(cacheDir(), "opencode", "models.json")]
@@ -95,6 +96,7 @@ function defaultEffort(meta: CatalogModel): string | null {
 // 安装别名 = catalog-bridge; 别名不匹配的副本返回空 hooks(见 shared/gate.ts)
 export const catalogBridge = async () => {
   if (!gateActive("catalog-bridge")) return {}
+  void maybeSync(() => {})
   return {
     config: (cfg: any) => {
       const catalog = loadCatalog()
