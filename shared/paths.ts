@@ -1,4 +1,4 @@
-// XDG 感知的标准目录(Linux 与 macOS 差异在 cacheDir 处理)
+// XDG 感知的标准目录，与 opencode 自身行为一致（opencode 用 xdg-basedir，所有平台默认 ~/.cache）
 
 import { homedir } from "node:os"
 import path from "node:path"
@@ -16,5 +16,5 @@ export function stateDir(): string {
 }
 
 export function cacheDir(): string {
-  return process.env.XDG_CACHE_HOME ?? (process.platform === "darwin" ? path.join(homedir(), "Library", "Caches") : path.join(homedir(), ".cache"))
+  return process.env.XDG_CACHE_HOME ?? path.join(homedir(), ".cache")
 }
