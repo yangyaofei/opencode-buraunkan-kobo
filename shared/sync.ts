@@ -130,15 +130,27 @@ export async function maybeSync(notify: (title: string, message: string) => void
   const state = readJson(file) as SyncState | undefined
   const throttleMs = cfg.throttleHours !== undefined ? Math.max(0, cfg.throttleHours) * 3600_000 : DEFAULT_THROTTLE_MS
   let head = state?.head
+  let fresh = false
   if (!head || Date.now() - state.lastCheck >= throttleMs) {
     const fetched = await lsRemoteHead(cfg.repo ?? DEFAULT_REPO, ref)
     if (!fetched) return // 网络失败: 不推进 lastCheck, 下次启动重试
     head = fetched
+    fresh = true
     atomicWrite(file, JSON.stringify({ lastCheck: Date.now(), head }, null, 2))
   }
 
   const cur = currentCommit(wrapper)
   if (!cur || cur === head) return
+  // 陈旧 head 防护: 缓存 head 与已装 commit 不匹配时, 窗口内远端可能推了新提交,
+  // 刚重装的副本(装在最新 commit)会被误判为落后 → 每次启动"重装→删除"死循环。
+  // 删除前用一次 fresh ls-remote 确认; 若已装的就是远端最新, 更新缓存不删。
+  if (!fresh) {
+    const fetched = await lsRemoteHead(cfg.repo ?? DEFAULT_REPO, ref)
+    if (!fetched) return
+    head = fetched
+    atomicWrite(file, JSON.stringify({ lastCheck: Date.now(), head }, null, 2))
+    if (cur === head) return
+  }
   try {
     rmSync(wrapper, { recursive: true, force: true })
   } catch {
