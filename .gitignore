@@ -1,3 +1,6 @@
 node_modules/
 bun.lock
 bun.lockb
+test/.win-*
+test/.real-*
+test/.report-*

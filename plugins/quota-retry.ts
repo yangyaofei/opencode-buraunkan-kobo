@@ -38,14 +38,17 @@
 //   - 非 429 响应原样透传
 //   - 配额 API 只在"确认配额耗尽"的 429 时才调用, 且有 cache 兜底
 
-import { execFileSync } from "node:child_process"
+import { execFileSync, spawnSync } from "node:child_process"
 import {
   chmodSync,
+  closeSync,
   copyFileSync,
   existsSync,
   mkdirSync,
+  openSync,
   readFileSync,
   readdirSync,
+  readSync,
   renameSync,
   rmSync,
   statSync,
@@ -60,7 +63,11 @@ import { gateActive } from "../shared/gate"
 import { maybeSync } from "../shared/sync"
 
 type ProviderConfig = {
-  id: string
+  // 匹配哪些 provider: 单个 ID、ID 数组; 配合 idPattern 可一条配置覆盖多个 provider
+  id: string | string[]
+  // 对 opencode 已配置的 providerID 做正则匹配(i 标志), 命中的都归入本条配置。
+  // 只能匹配运行时已存在的 provider(报告无法枚举, 以 opencode.jsonc 为准)
+  idPattern?: string
   quota: "zhipu" | "body"
   quotaUrl?: string
   quotaMatch?: string
@@ -125,6 +132,29 @@ function loadConfig(projectDir: string): PluginConfig {
     if (parsed !== undefined) return parsed
   }
   return { providers: [] }
+}
+
+// provider 条目展开: id 支持数组, idPattern 对 existingProviderIds(opencode 已配置的
+// providerID) 做正则匹配。返回 具体 providerID → 该 ID 视角的配置(克隆, id 固化为
+// 具体值): 下游(toast 文案/auth.json 查找/配额缓存键)全部按具体 ID 工作, 不感知多匹配。
+// 同一 ID 命中多条配置时先到先得; idPattern 非法正则时整条跳过, 不产生半生效配置
+function expandProviders(cfg: PluginConfig, existingProviderIds: string[]): Map<string, ProviderConfig> {
+  const out = new Map<string, ProviderConfig>()
+  for (const p of cfg.providers ?? []) {
+    if (!p) continue
+    const ids = new Set<string>()
+    for (const id of Array.isArray(p.id) ? p.id : [p.id]) if (id) ids.add(id)
+    if (p.idPattern) {
+      try {
+        const re = new RegExp(p.idPattern, "i")
+        for (const pid of existingProviderIds) if (re.test(pid)) ids.add(pid)
+      } catch {
+        continue
+      }
+    }
+    for (const id of ids) if (!out.has(id)) out.set(id, { ...p, id })
+  }
+  return out
 }
 
 function readApiKey(providerID: string): string | undefined {
@@ -371,25 +401,39 @@ type PatchOpts = { maxRetries?: number; backoffCapMs?: number }
 const CHAIN_VALS_RE = /^,[A-Za-z_$][\w$]{0,2}=(\d{2,6}),[A-Za-z_$][\w$]{1,3}=\d{9,10},[A-Za-z_$][\w$]{0,2}=(\d{1,3})$/
 
 function patchBinary(bin: string, opts: PatchOpts): PatchStatus {
+  return patchBinaryFull(bin, opts).status
+}
+
+type PatchResult = { status: PatchStatus; windows?: PatchWindows }
+
+function patchBinaryFull(bin: string, opts: PatchOpts): PatchResult {
   let buf = readFileSync(bin)
   let chain = findRetryChain(buf)
-  if (!chain) return "notfound"
+  if (!chain) return { status: "notfound" }
 
   const cur0 = chain.span.match(CHAIN_VALS_RE)
-  if (!cur0) return "notfound"
+  if (!cur0) return { status: "notfound" }
 
-  // 备份新鲜度: 等长补丁 size 恒不变, size 不同 = 跨版本旧备份。
-  // 备份过期/丢失时: 当前二进制无补丁标记 → 它本身就是出厂态;
+  // 备份新鲜度(内容判定, 见 backupFresh): 备份 = 无补丁标记的出厂态。
+  // 备份不可用/丢失时: 当前二进制无补丁标记 → 它本身就是出厂态, 直接重建备份;
   // 带补丁标记 → 从当前二进制反推(等长逆向)重建一份功能出厂态备份
   const bak = `${bin}.retry-bak`
-  const bakStale = existsSync(bak) && statSync(bak).size !== statSync(bin).size
+  const bakPristine = (() => {
+    if (!existsSync(bak)) return false
+    try {
+      return backupFresh(readFileSync(bak))
+    } catch {
+      return false
+    }
+  })()
   const pristine = (() => {
-    if (!bakStale && existsSync(bak)) {
-      const b = findRetryChain(readFileSync(bak))
-      return b ? { chain: b, src: readFileSync(bak) } : undefined
+    if (bakPristine) {
+      const src = readFileSync(bak)
+      const b = findRetryChain(src)
+      return b ? { chain: b, src } : undefined
     }
     if (!hasUnlimitedPatch(buf) && !hasBackoffCap(buf, chain)) {
-      if (bakStale) writeBak(bin, buf) // 无标记 = 出厂态, 直接以它重建备份
+      writeBak(bin, buf) // 无标记 = 出厂态: 备份缺失或不可用, 以当前二进制重建
       return { chain, src: buf }
     }
     const syn = synthesizePristine(buf, chain)
@@ -401,10 +445,10 @@ function patchBinary(bin: string, opts: PatchOpts): PatchStatus {
   })()
   if (!pristine) {
     rmSync(bak, { force: true }) // 不可用的备份不如没有
-    return "conflict"
+    return { status: "conflict" }
   }
   const pvals = pristine.chain.span.match(CHAIN_VALS_RE)
-  if (!pvals) return "notfound"
+  if (!pvals) return { status: "notfound" }
 
   // 期望态: 显式配置优先, 未配置的轴 = 出厂值
   const want = {
@@ -414,45 +458,49 @@ function patchBinary(bin: string, opts: PatchOpts): PatchStatus {
     cap: opts.backoffCapMs !== undefined,
   }
 
-  // 已在目标态: 不动二进制(次数在无限模式下是死代码, 不比较; 过期备份已在上面重建)
+  // 已在目标态: 不动二进制(次数在无限模式下是死代码, 不比较)
   const sameState =
     hasUnlimitedPatch(buf) === want.unlimited &&
     (want.unlimited || Number(cur0[2]) === want.yh) &&
     (want.cap ? Number(cur0[1]) === want.th : !hasBackoffCap(buf, chain))
-  if (sameState) return "already"
+  if (sameState) return { status: "already", windows: extractWindows(buf, chain) }
 
-  // 需要动手: 一律回到出厂态再整体重打, 不做任意历史布局间的增量改写
-  if (bakStale || existsSync(bak)) {
-    if (!restoreBinary(bin)) return "conflict"
+  // 需要动手: 一律回到出厂态再整体重打, 不做任意历史布局间的增量改写。
+  // 走到这里 bak 一定是可用出厂态(pristine 块已保证); 当前二进制本身是出厂态时跳过还原
+  const binPristine = !hasUnlimitedPatch(buf) && !hasBackoffCap(buf, chain)
+  if (existsSync(bak) && !binPristine) {
+    if (!restoreBinary(bin)) return { status: "conflict" }
     buf = readFileSync(bin)
     chain = findRetryChain(buf)
-    if (!chain) return "notfound"
+    if (!chain) return { status: "notfound" }
   }
 
   // 从出厂态一次性应用全部补丁(单次写入/重命名/重签名)
   const fvals = chain.span.match(CHAIN_VALS_RE)
-  if (!fvals) return "notfound"
+  if (!fvals) return { status: "notfound" }
   const edits: Array<{ at: number; from: string; to: string }> = []
   if (want.th !== Number(fvals[1]) || want.yh !== Number(fvals[2])) {
     const newSpan = rewriteSpan(chain, want.th, want.yh)
-    if (!newSpan) return "invalid"
+    if (!newSpan) return { status: "invalid" }
     edits.push({ at: chain.spanStart, from: chain.span, to: newSpan })
   }
   if (want.unlimited) {
     const at = buf.indexOf(`.attempt>${chain.retryVar})`)
-    if (at === -1) return "notfound"
+    if (at === -1) return { status: "notfound" }
     const rep = unlimitedReplacement(chain.retryVar)
-    if (!rep) return "notfound"
+    if (!rep) return { status: "notfound" }
     edits.push({ at: at + ".attempt".length, from: `>${chain.retryVar})`, to: rep })
   }
   if (want.cap) {
     const site = findBackoffSite(buf, chain)
-    if (!site) return "notfound"
+    if (!site) return { status: "notfound" }
     edits.push({ at: site.at, from: site.from, to: semicolons(site.from.length) })
   }
-  if (edits.length === 0) return "already"
+  if (edits.length === 0) return { status: "already", windows: extractWindows(buf, chain) }
   writePatched(bin, buf, edits)
-  return "patched"
+  // 窗口指纹取自补丁后的内容(常量链可能已被 rewriteSpan 改写, 需重解析)
+  const after = findRetryChain(buf)
+  return { status: "patched", windows: after ? extractWindows(buf, after) : undefined }
 }
 
 // 备份写入: tmp + rename 原子替换(内容可能是合成的出厂态 Buffer)
@@ -552,11 +600,103 @@ function restoreBinary(bin: string): boolean {
   return true
 }
 
+// ===== 补丁后验证 =====
+// patchBinary 返回 "patched" 只代表字节写入 + codesign 退出码 0, 不代表补丁可用。
+// 真正的 "patched" = verifyPatchBin(回读比对 + 签名校验) 且 bootSmoke(启动冒烟) 通过;
+// 任一失败自动还原出厂并告警, 状态缓存只在验证通过后落盘。
+
+// 补丁目标态(四轴), 供 verifyPatchBin 回读比对
+type PatchWant = { unlimited: boolean; yh?: number; th?: number; cap: boolean }
+
+// 备份新鲜度(内容判定): 备份 = 能解析出重试常量链且不带任何补丁标记的出厂态二进制。
+// 不用 size 比较: 等长补丁 size 恒不变, 但 codesign 重签名会改变 size —— size 判据会把
+// 完好的出厂态备份误报成"跨版本旧备份"
+function backupFresh(buf: Buffer): boolean {
+  const chain = findRetryChain(buf)
+  return !!chain && !hasUnlimitedPatch(buf) && !hasBackoffCap(buf, chain)
+}
+
+// 回读校验: 重读磁盘 → 常量链/补丁标记与期望态逐一比对 + darwin 签名校验。
+// 独立于写入路径, 防"写入成功但内容不对"的假象
+function verifyPatchBin(bin: string, want: PatchWant): { ok: boolean; reason?: string } {
+  let buf: Buffer
+  try {
+    buf = readFileSync(bin)
+  } catch (e) {
+    return { ok: false, reason: `回读失败: ${(e as Error).message}` }
+  }
+  const chain = findRetryChain(buf)
+  if (!chain) return { ok: false, reason: "回读后找不到重试常量链" }
+  const cur = chain.span.match(CHAIN_VALS_RE)
+  if (!cur) return { ok: false, reason: "回读后常量链无法解析" }
+  if (hasUnlimitedPatch(buf) !== want.unlimited) return { ok: false, reason: "无限重试标记与预期不符" }
+  if (!want.unlimited && want.yh !== undefined && Number(cur[2]) !== want.yh)
+    return { ok: false, reason: `次数上限 回读=${cur[2]}, 期望=${want.yh}` }
+  if (hasBackoffCap(buf, chain) !== want.cap) return { ok: false, reason: "退避封顶标记与预期不符" }
+  if (want.cap && want.th !== undefined && Number(cur[1]) !== want.th)
+    return { ok: false, reason: `封顶值 回读=${cur[1]}, 期望=${want.th}` }
+  if (process.platform === "darwin") {
+    try {
+      execFileSync("codesign", ["-v", bin], { stdio: "ignore", timeout: 30_000 })
+    } catch {
+      return { ok: false, reason: "codesign -v 签名校验失败" }
+    }
+  }
+  return { ok: true }
+}
+
+// 启动冒烟: 补丁破坏模块图 / 签名被内核 SIGKILL / 文件截断, 都表现为 --version 无法
+// 正常退出。exit 0 = 二进制可执行(插件侧能做到的最强功能验证)
+function bootSmoke(bin: string): boolean {
+  try {
+    const r = spawnSync(bin, ["--version"], { timeout: 20_000, stdio: "ignore" })
+    return r.status === 0
+  } catch {
+    return false
+  }
+}
+
+// stat 缓存的窗口指纹: 常量链 + 无限标记两处字节窗的 (偏移, 内容)。
+// 缓存命中时只读这两处小窗比对, 不匹配 → 缓存作废走全量流程
+type PatchWindows = { chainAt: number; chainSpan: string; unlimAt: number; unlimMark: string }
+
+function extractWindows(buf: Buffer, chain: RetryChain): PatchWindows | undefined {
+  const anchor = [".attempt>", ".attempt<"].map((a) => ({ a, at: buf.indexOf(a) })).find((x) => x.at !== -1)
+  if (!anchor) return undefined
+  return {
+    chainAt: chain.spanStart,
+    chainSpan: chain.span,
+    unlimAt: anchor.at,
+    unlimMark: buf.slice(anchor.at, anchor.at + 16).toString("latin1"),
+  }
+}
+
+function windowsMatch(bin: string, rec: { chainAt?: number; chainSpan?: string; unlimAt?: number; unlimMark?: string }): boolean {
+  if (rec.chainAt === undefined || rec.chainSpan === undefined || rec.unlimAt === undefined || rec.unlimMark === undefined)
+    return false
+  try {
+    const fd = openSync(bin, "r")
+    try {
+      const readWin = (at: number, len: number) => {
+        const b = Buffer.alloc(len)
+        const n = readSync(fd, b, 0, len, at)
+        return n === len ? b.toString("latin1") : undefined
+      }
+      return readWin(rec.chainAt, rec.chainSpan.length) === rec.chainSpan && readWin(rec.unlimAt, rec.unlimMark.length) === rec.unlimMark
+    } finally {
+      closeSync(fd)
+    }
+  } catch {
+    return false
+  }
+}
+
 // ===== 补丁状态缓存 =====
 // 每次启动对 3 份 ~184MB 二进制做 readFileSync+全量扫描代价高(首次实测拖慢启动)。
 // 补丁是 (二进制内容, 配置) 的确定函数, 用 size+mtimeMs+目标 描述"已做过什么",
-// 命中即跳过读盘与写入; npm 升级换文件/配置变更 → stat 变化 → 自动失效重做。
-type PatchStateEntry = { size: number; mtimeMs: number; want: string }
+// 命中时只做窗口校验(两处小窗 positioned read)而非完全跳过 —— 缓存只能证明
+// "以前打过", 窗口比对才能证明"现在还是这个状态"; 校验不过自动失效走全量流程。
+type PatchStateEntry = { size: number; mtimeMs: number; want: string } & Partial<PatchWindows>
 
 function patchStateFile(): string {
   return path.join(cacheDir(), "opencode", "quota-retry-patch-state.json")
@@ -615,27 +755,49 @@ function runPatch(cfg: PatchConfig, notify: (title: string, message: string, var
   for (const bin of bins) {
     const st = binStat(bin)
     if (!st) continue
-    // 幂等跳过: 同二进制同目标 → 不读盘不写入不 toast
+    // 幂等跳过: 同二进制同目标 且 字节窗吻合 → 不读盘不写入不 toast;
+    // 窗口不符(文件被换/被改/版本更替) → 缓存作废, 落到全量检查
     const hit = state[bin]
-    if (hit && hit.size === st.size && hit.mtimeMs === st.mtimeMs && hit.want === want) continue
+    if (hit && hit.size === st.size && hit.mtimeMs === st.mtimeMs && hit.want === want && windowsMatch(bin, hit)) continue
 
     let ok = false
+    let result: PatchResult | undefined
     try {
       if (restore) {
         const r = restoreBinary(bin)
         if (r) notify("quota-retry 补丁", `已还原出厂 (${path.basename(bin)})`)
         ok = true
       } else {
-        const r = patchBinary(bin, { maxRetries, backoffCapMs: cap })
-        if (r === "patched") notify("quota-retry 补丁", `${label} 已写入 (${path.basename(bin)}), 下次启动生效`)
-        else if (r === "conflict")
+        const r = patchBinaryFull(bin, { maxRetries, backoffCapMs: cap })
+        result = r
+        if (r.status === "patched") {
+          // 写入 ≠ 成功: 回读比对 + 签名校验 + 启动冒烟, 全过才算 patched;
+          // 任一失败自动还原出厂, 状态不落盘 → 下次启动重试
+          const expect: PatchWant = {
+            unlimited: maxRetries === -1,
+            yh: maxRetries > 0 ? maxRetries : undefined,
+            th: cap,
+            cap: cap !== undefined,
+          }
+          const v = verifyPatchBin(bin, expect)
+          if (!v.ok) {
+            restoreBinary(bin)
+            notify("quota-retry 补丁", `补丁验证失败(${v.reason}), 已还原出厂 (${path.basename(bin)})`, "warning")
+          } else if (!bootSmoke(bin)) {
+            restoreBinary(bin)
+            notify("quota-retry 补丁", `补丁后二进制无法启动, 已还原出厂 (${path.basename(bin)})`, "warning")
+          } else {
+            notify("quota-retry 补丁", `${label} 已写入并通过验证 (${path.basename(bin)}), 下次启动生效`)
+            ok = true
+          }
+        } else if (r.status === "conflict")
           notify("quota-retry 补丁", `需拆除已打补丁但找不到 .retry-bak 备份, 请重装 opencode 后重启 (${path.basename(bin)})`, "warning")
-        else if (r === "invalid")
+        else if (r.status === "invalid")
           notify("quota-retry 补丁", `位数装不下: 封顶与次数组合超出等长预算 (${path.basename(bin)})`, "warning")
-        else if (r === "notfound")
+        else if (r.status === "notfound")
           notify("quota-retry 补丁", `未找到重试常量链, opencode 版本可能已大改, 跳过 (${path.basename(bin)})`, "warning")
-        // "already" 静默: 状态文件缺失但二进制已是目标, 记入状态即可
-        ok = r === "patched" || r === "already"
+        // "already" 静默: 本次已读盘确认字节为期望态(patchBinaryFull sameState), 记入状态即可
+        if (r.status === "already") ok = true
       }
     } catch (e) {
       const msg = (e as Error).message.includes("codesign")
@@ -645,7 +807,7 @@ function runPatch(cfg: PatchConfig, notify: (title: string, message: string, var
     }
     if (ok) {
       const after = binStat(bin) ?? st
-      state[bin] = { ...after, want }
+      state[bin] = { ...after, want, ...(result?.windows ?? {}) }
       changed = true
     }
   }
@@ -707,14 +869,17 @@ function patchStatusReport(projectDir: string, binsOverride?: string[]): string 
   if (cfg.providers?.length) {
     lines.push("providers(429 拦截):")
     for (const p of cfg.providers) {
-      if (!p?.id) continue
-      const parts = [p.id, `配额判定=${p.quota}`]
+      if (!p || (!p.id && !p.idPattern)) continue
+      const idText = Array.isArray(p.id) ? p.id.join(" | ") : (p.id ?? "")
+      const parts = [idText, ...(p.idPattern ? [`idPattern=/${p.idPattern}/i`] : []), `配额判定=${p.quota}`]
       parts.push(p.quotaMatch ? "quotaMatch=自定义" : "quotaMatch=内置默认")
       parts.push(p.resetExtract ? "resetExtract=自定义" : "resetExtract=内置默认")
       parts.push(`fallbackWaitMs=${p.fallbackWaitMs ?? DEFAULT_FALLBACK_WAIT_MS}`)
       parts.push(`bufferMs=${p.bufferMs ?? DEFAULT_BUFFER_MS}`)
       lines.push(`  - ${parts.join(", ")}`)
     }
+    if (cfg.providers.some((p) => p?.idPattern))
+      lines.push("  (idPattern 在运行时对 opencode 已配置的 providerID 做匹配, 报告无法枚举命中列表)")
   } else {
     lines.push("providers(429 拦截): 未配置")
   }
@@ -770,16 +935,21 @@ function patchStatusReport(projectDir: string, binsOverride?: string[]): string 
       th: Number(cur[1]),
       cap: hasBackoffCap(buf, chain),
     }
-    // 出厂基线: 新鲜备份(等长补丁 size 恒不变, size 相同才可信) > 无补丁标记的当前链 > 未知
+    // 出厂基线: 内容可用的出厂态备份 > 无补丁标记的当前链 > 未知。
+    // 备份判定看内容(backupFresh)而非 size —— codesign 重签名会改 size, size 相异≠跨版本
     const bak = `${bin}.retry-bak`
     let factory: { th: number; yh: number } | undefined
     let bakNote = ""
     if (existsSync(bak)) {
-      if (statSync(bak).size === statSync(bin).size) {
-        const bv = findRetryChain(readFileSync(bak))?.span.match(CHAIN_VALS_RE)
-        if (bv) factory = { th: Number(bv[1]), yh: Number(bv[2]) }
+      const bbuf = readFileSync(bak)
+      const bchain = findRetryChain(bbuf)
+      const bv = bchain?.span.match(CHAIN_VALS_RE)
+      if (bchain && backupFresh(bbuf) && bv) {
+        factory = { th: Number(bv[1]), yh: Number(bv[2]) }
+        if (statSync(bak).size !== statSync(bin).size)
+          bakNote = "备份为可用出厂态(size 与当前不同 — 重签名尺寸差或跨版本, 内容可用)"
       } else {
-        bakNote = "备份与当前二进制版本不一致(跨版本旧备份), 下次需要改动时自动从当前二进制重建"
+        bakNote = "备份内容异常(无法解析为出厂态), 下次需要改动时自动从当前二进制重建"
         if (!actual.unlimited && !actual.cap) factory = { th: actual.th, yh: actual.yh }
       }
     } else if (!actual.unlimited && !actual.cap) {
@@ -817,10 +987,19 @@ function patchStatusReport(projectDir: string, binsOverride?: string[]): string 
     const rec = state[bin]
     const st = binStat(bin)
     if (rec) {
-      const hit = st && rec.size === st.size && rec.mtimeMs === st.mtimeMs
-      lines.push(`  状态缓存: ${rec.want}${hit ? " (stat 命中, 下次启动跳过检查)" : " (stat 已变化, 下次启动重新检查)"}`)
+      const hit = st && rec.size === st.size && rec.mtimeMs === st.mtimeMs && windowsMatch(bin, rec)
+      lines.push(
+        `  状态缓存: ${rec.want}${hit ? " (stat+窗口命中, 下次启动跳过检查)" : hit === false && st && rec.size === st.size && rec.mtimeMs === st.mtimeMs ? " (字节窗不符, 下次启动全量重查)" : " (stat 已变化, 下次启动重新检查)"}`,
+      )
     } else {
       lines.push("  状态缓存: 无记录(下次启动全量检查)")
+    }
+    // 进程新鲜度: 磁盘补丁状态 ≠ 当前进程行为。补丁在启动时 setImmediate 写入,
+    // 只对"下次启动"生效; 二进制 mtime 晚于本进程启动时间 → 本会话加载的是补丁前代码
+    if (st && (actual.unlimited || actual.cap)) {
+      const procStartMs = Date.now() - process.uptime() * 1000
+      if (st.mtimeMs > procStartMs + 2000)
+        lines.push("  当前进程: 启动于本次补丁写入之前 — 本会话仍为补丁前行为, 重启后生效")
     }
     if (bakNote) lines.push(`  备份: ${bakNote}`)
   })
@@ -941,6 +1120,7 @@ export const quotaRetry = async (input: { directory?: string; client?: any }) =>
     entries: OnDemandModel[],
     quotaFetch: ((url: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => Promise<Response>) | undefined,
     cfg: any,
+    expandedProviders: Map<string, ProviderConfig>,
   ) {
     const virtualById = new Map(entries.map((e) => [e.model, e]))
     const toastAt = new Map<string, number>()
@@ -950,7 +1130,7 @@ export const quotaRetry = async (input: { directory?: string; client?: any }) =>
       toast(title, message, "info")
     }
     const quotaMatchFor = (providerID: string): RegExp => {
-      const p = (pluginConfig.providers ?? []).find((x) => x && x.id === providerID)
+      const p = expandedProviders.get(providerID)
       return new RegExp(p?.quotaMatch ?? DEFAULT_QUOTA_MATCH, "i")
     }
 
@@ -1034,8 +1214,10 @@ export const quotaRetry = async (input: { directory?: string; client?: any }) =>
           e.chain.length > 0 &&
           e.chain.every((h) => h && typeof h.model === "string" && h.model),
       )
-      const providerIds = new Set<string>()
-      for (const p of pluginConfig.providers ?? []) if (p && p.id) providerIds.add(p.id)
+      // 展开多 provider 匹配(id 数组 + idPattern): idPattern 对 opencode 已配置的
+      // providerID 求命中; 展开 ID 与 on-demand 挂载组合并成完整拦截集合
+      const expanded = expandProviders(pluginConfig, Object.keys(cfg.provider ?? {}))
+      const providerIds = new Set<string>(expanded.keys())
       for (const e of onDemand) providerIds.add(e.provider)
       if (providerIds.size === 0) return
       cfg.provider = cfg.provider ?? {}
@@ -1068,11 +1250,13 @@ export const quotaRetry = async (input: { directory?: string; client?: any }) =>
       }
       for (const id of providerIds) {
         const existing = cfg.provider[id] ?? {}
-        const quotaP = (pluginConfig.providers ?? []).find((p) => p && p.id === id)
+        const quotaP = expanded.get(id)
         const odEntries = onDemandByProvider.get(id) ?? []
         const fetchFn = odEntries.length
-          ? makeOnDemandFetch(odEntries, quotaP ? makeFetch(quotaP) : undefined, cfg)
-          : makeFetch(quotaP!)
+          ? makeOnDemandFetch(odEntries, quotaP ? makeFetch(quotaP) : undefined, cfg, expanded)
+          : quotaP
+            ? makeFetch(quotaP)
+            : undefined
         // 注册虚模型(用户未手写同名模型时); 元数据复制自 chain 首目标的 catalog 条目
         let models = existing.models
         if (odEntries.length) {
@@ -1089,7 +1273,7 @@ export const quotaRetry = async (input: { directory?: string; client?: any }) =>
         cfg.provider[id] = {
           ...existing,
           ...(models ? { models } : {}),
-          options: { ...(existing.options ?? {}), fetch: fetchFn },
+          options: { ...(existing.options ?? {}), ...(fetchFn ? { fetch: fetchFn } : {}) },
         }
       }
     },
@@ -1117,5 +1301,19 @@ export const quotaRetry = async (input: { directory?: string; client?: any }) =>
 
 // 测试钩子挂在导出函数的属性上: 本仓库 index.ts 只导出插件函数,
 // 任何非函数导出都会导致模块加载失败
-;(quotaRetry as any).__internals = { patchStatusReport, patchBinary, synthesizePristine, findRetryChain, hasUnlimitedPatch, hasBackoffCap }
+;(quotaRetry as any).__internals = {
+  patchStatusReport,
+  patchBinary,
+  patchBinaryFull,
+  synthesizePristine,
+  findRetryChain,
+  hasUnlimitedPatch,
+  hasBackoffCap,
+  backupFresh,
+  verifyPatchBin,
+  bootSmoke,
+  windowsMatch,
+  expandProviders,
+  restoreBinary,
+}
 

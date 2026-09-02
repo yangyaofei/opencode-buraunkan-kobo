@@ -62,19 +62,20 @@ opencode 按响应头决定等待时间：`retry-after-ms` > `retry-after` > 指
 ### 配置
 
 全局 `~/.config/opencode/quota-retry.jsonc`，项目 `.opencode/quota-retry.jsonc`
-优先。一个 provider 一条：
+优先。一条配置可覆盖一个或多个 provider（`id` 数组 / `idPattern` 正则）：
 
 ```jsonc
 {
   "providers": [
     {
-      "id": "zhipuai-coding-plan",   // opencode 里的 providerID
+      "id": "zhipuai-coding-plan",   // 单个 opencode providerID
       "quota": "zhipu",              // 重置时间来源: zhipu | body
       "fallbackWaitMs": 30000,       // 拿不到重置时间时每次重试等多久(毫秒)
       "bufferMs": 10000              // 在计算出的等待上额外加的缓冲(毫秒)
     },
     {
-      "id": "volces-ark",
+      // 同族 provider 一条覆盖: id 数组或 idPattern 正则任选其一, 也可同时用
+      "id": ["volces-ark", "volces-ark-agent-plan"],
       "quota": "body",
       // 判定 429 是不是配额耗尽(不匹配则透传, 走 opencode 原生重试)
       "quotaMatch": "AccountQuotaExceeded|exceeded the .*usage quota",
@@ -82,6 +83,11 @@ opencode 按响应头决定等待时间：`retry-after-ms` > `retry-after` > 指
       "resetExtract": "reset at\\s+((?:\\d{4}-\\d{2}-\\d{2})\\s+\\d{2}:\\d{2}:\\d{2})",
       "fallbackWaitMs": 30000,
       "bufferMs": 10000
+    },
+    {
+      "id": "zhipu-fallback",        // 正则只匹配 opencode 已配置的 providerID
+      "idPattern": "^zhipu-",        // 命中的每个 provider 都归入本条
+      "quota": "body"
     }
   ],
   "quotaCacheMs": 60000              // 配额查询结果缓存时长(毫秒)
@@ -90,7 +96,8 @@ opencode 按响应头决定等待时间：`retry-after-ms` > `retry-after` > 指
 
 | 字段 | 必填 | 说明 |
 |---|---|---|
-| `id` | 是 | opencode 的 providerID，如 `zhipuai-coding-plan`、`volces-ark` |
+| `id` | 是* | opencode 的 providerID，如 `zhipuai-coding-plan`、`volces-ark`；也接受 ID 数组一次覆盖多个。*与 `idPattern` 至少配一个 |
+| `idPattern` | 否 | 正则（i 标志）对 opencode 已配置的 providerID 求匹配，命中的都归入本条；同一 providerID 命中多条配置时先到先得 |
 | `quota` | 是 | 重置时刻来源：`zhipu`（配额查询接口，失败回退 `resetExtract`）或 `body`（只用 `resetExtract`） |
 | `quotaMatch` | 否 | 判定 429 是不是配额耗尽的正则；不匹配的 429 不注入，走原生重试 |
 | `resetExtract` | 否 | 从 429 正文提取重置时刻的正则，捕获组 1 = 完整时间串；无时区后缀按 +08:00 |
