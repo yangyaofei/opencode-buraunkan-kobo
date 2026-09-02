@@ -261,6 +261,13 @@ are registered but never reaped (safe default). Deletion goes through
 already clean. After a `set` the file is rewritten as plain JSON (comments
 are owned by the program).
 
+`maxSessions` means **the number of historical sessions to keep, not a cap on
+the bucket size**: `run` trims history to the limit first, then registers the
+current session (exempt from that trim), so every `run` ends with
+`maxSessions + 1` entries (N historical + the current one); the excess is
+corrected by the next `run`. Example: with `maxSessions: 2` you will see
+3 sessions — expected behavior.
+
 ### Activity log
 
 Every `run` / `reap` / `set` appends one JSONL line to `log.jsonl` next to

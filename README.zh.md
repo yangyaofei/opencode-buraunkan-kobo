@@ -224,6 +224,11 @@ session + 数十个 subagent 子会话，无人治理时 opencode.db 无限膨�
 删除走 `DELETE /session/:id`，级联删除全部 subagent 子会话；404 视为已清理。
 `set` 后文件被程序重写为纯 JSON（注释归程序管）。
 
+`maxSessions` 的语义是**保留的历史条数，不是桶内总数上限**：`run` 先按上限裁剪
+历史，再登记当前 session（本次不参与裁剪），所以每次 run 结束时桶内为
+`maxSessions + 1` 条（N 条历史 + 当前 1 条），超出部分由下次 run 修正。
+例：`maxSessions: 2` 时会看到 3 个 session，属预期行为。
+
 ### 行为日志
 
 每次 `run` / `reap` / `set` 追加一条 JSONL 到 registry 同目录的 `log.jsonl`
