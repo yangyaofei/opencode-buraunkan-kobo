@@ -30,12 +30,19 @@
 import { appendFileSync, mkdirSync } from "node:fs"
 import {
   computeWaitMs,
+  expandOnDemand,
   expandProviders,
   isQuotaError,
+  isQuotaText,
+  markDead,
+  pickHop,
   parseResetAtMs,
+  readProviderApiKeys,
   stripTrailingEmptyUsers,
+  xdgDataDir,
   zhipuResetAtMs,
   DEFAULT_QUOTA_CACHE_MS,
+  DEFAULT_FALLBACK_WAIT_MS,
   type PluginConfig,
   type ProviderConfig,
 } from "./core"
@@ -48,7 +55,10 @@ type Ctx = {
     hook: (name: string, cb: (evt: any) => any) => Promise<{ dispose: () => Promise<void> }>
     synthetic: (input: { sessionID: string; text: string; description?: string }) => Promise<unknown>
   }
-  provider: { list: () => Promise<ReadonlyArray<any>> }
+  provider: {
+    list: () => Promise<ReadonlyArray<any>>
+    transform: (cb: (editor: any) => void) => Promise<unknown>
+  }
   command: { transform: (cb: (editor: { add: (def: any) => void }) => void) => Promise<unknown> }
   tool: { transform: (cb: (editor: { add: (def: any) => void }) => void) => Promise<unknown> }
   event: { subscribe: () => AsyncIterable<any> }
@@ -106,6 +116,77 @@ export default {
     }
     await refreshExpanded()
 
+    // ── on-demand 虚模型降级链(1.x onDemandModels 移植) ──
+    const onDemand = expandOnDemand((cfg as any).onDemandModels)
+    const odReloadTries = new Map<string, number>()
+    // 链跳 apiKey 解析优先级: 显式配置 > opencode.db credential 表(2.x 无 HTTP 路由交回 key)
+    let credKeys: Record<string, string> | null = null
+    const hopApiKey = (provider: string | undefined, explicit?: string) => {
+      if (explicit) return explicit
+      if (!provider) return undefined
+      if (credKeys === null) {
+        try {
+          credKeys = readProviderApiKeys(xdgDataDir())
+        } catch {
+          credKeys = null
+        }
+      }
+      return credKeys?.[provider] ?? authCache.get(provider)
+    }
+    dbg(`[boot] loaded: providers=${(cfg.providers ?? []).length} onDemand=${onDemand.length} maxRounds=${maxRounds}`)
+    // 挂载组不在此创建: 插件 provider.add 只支持 native 包契约(@opencode/ai/providers/* 的
+    // model(modelID, settings) 导出), 而 native 通道不挂插件 http/retry hook 且 2.0.15 有未知缺陷
+    // (429 → error{type:"unknown", message:"Invalid Date"}, 分类/重试/hook 全部失效)。
+    // aisdk 通道(npm:@ai-sdk/openai-compatible, hook 全通)只能由 config 声明进入——
+    // 因此挂载组由用户在 opencode.jsonc 里声明(npm:@ai-sdk/openai-compatible + 链首跳 baseURL),
+    // 插件负责运行时链改写(http.request)与配额死亡标记(http.response)。
+
+    // ── on-demand HTTP 链运行时(挂 http.request/http.response hook, 均为已验证可用的通道) ──
+    // 每会话: 链死亡时刻表 + 最近一次请求用的跳(供 http.response 归因)
+    const chainStates = new Map<string, { deadUntil: Map<number, number>; lastHop: number }>()
+    const chainOf = (providerID: string, modelID: string) =>
+      onDemand.find((m) => m.provider === providerID && m.model === modelID)
+    const stateOf = (sid: string) => {
+      let st = chainStates.get(sid)
+      if (!st) {
+        st = { deadUntil: new Map(), lastHop: 0 }
+        chainStates.set(sid, st)
+      }
+      return st
+    }
+    // http.request: 虚模型请求按链状态改写到活跳(改 URL/Authorization/body.model)
+    const chainRewrite = async (evt: any) => {
+      const providerID = String(evt?.model?.providerID ?? "")
+      const modelID = String(evt?.model?.id ?? evt?.model?.modelID ?? "")
+      const virtual = chainOf(providerID, modelID)
+      if (!virtual || virtual.chain.length === 0) return
+      const st = stateOf(String(evt.sessionID ?? ""))
+      const hop = pickHop(virtual.chain, st)
+      st.lastHop = hop
+      if (hop === 0) return // 链首活: 请求本就指向链首(挂载组 baseURL), 无需改写
+      const entry = virtual.chain[hop]
+      try {
+        const orig = evt.request as Request
+        const u = new URL(orig.url)
+        const b = new URL(entry.baseURL)
+        const basePath = b.pathname.replace(/\/$/, "")
+        const suffix = u.pathname.startsWith(basePath) ? u.pathname.slice(basePath.length) : u.pathname
+        const body: any = JSON.parse(await orig.clone().text())
+        const next = JSON.stringify({ ...body, model: entry.model })
+        const rewritten = new Request(b.origin + basePath + suffix, {
+          method: orig.method,
+          headers: new Headers(orig.headers),
+          body: orig.method === "GET" || orig.method === "HEAD" ? undefined : next,
+        })
+        const hopKey = hopApiKey(entry.provider, entry.apiKey)
+        if (hopKey) rewritten.headers.set("authorization", `Bearer ${hopKey}`)
+        evt.request = rewritten
+        dbg(`[on-demand] ${providerID}/${modelID} 第 ${hop + 1} 跳改写 → ${entry.baseURL} model=${entry.model}`)
+      } catch (err) {
+        dbg("[on-demand] 改写失败(裸请求照发):", String(err))
+      }
+    }
+
     // ── 会话内状态 ──
     const recent429 = new Map<string, { at: number; text: string }>() // sid -> 最近 429 body
     const zhipuCache = new Map<string, { at: number; resetAt: number }>() // providerID -> 精确重置时刻缓存
@@ -134,17 +215,27 @@ export default {
           const auth = req.headers.get("authorization")
           if (auth) authCache.set(providerID, auth.replace(/^Bearer\s+/i, ""))
         }
-        if (req.method !== "POST") return
-        const body: any = await req.clone().json().catch(() => null)
-        if (!body || !Array.isArray(body.messages) || body.messages.length === 0) return
-        const stripped = stripTrailingEmptyUsers(body.messages)
-        if (!stripped) return
-        const headers = new Headers(req.headers)
-        headers.delete("content-length")
-        evt.request = new Request(req, { method: "POST", headers, body: JSON.stringify({ ...body, messages: stripped }) })
-        dbg("[strip] removed trailing empty user message(s)")
+        // 注意: 这里只能用嵌套块, 不能 return — return 会跳过尾部的 chainRewrite(虚模型链改写),
+        // 同一轮原生重试全部漏改写(实测卡死在第 1 跳)。
+        if (req.method === "POST") {
+          const body: any = await req.clone().json().catch(() => null)
+          if (body && Array.isArray(body.messages) && body.messages.length > 0) {
+            const stripped = stripTrailingEmptyUsers(body.messages)
+            if (stripped) {
+              const headers = new Headers(req.headers)
+              headers.delete("content-length")
+              evt.request = new Request(req, { method: "POST", headers, body: JSON.stringify({ ...body, messages: stripped }) })
+              dbg("[strip] removed trailing empty user message(s)")
+            }
+          }
+        }
       } catch (err) {
         dbg("[strip] error:", String(err))
+      }
+      try {
+        await chainRewrite(evt)
+      } catch (err) {
+        dbg("[on-demand] rewrite error:", String(err))
       }
     })
 
@@ -162,17 +253,46 @@ export default {
 
     // ── 部件 1a: 抓 429 body(retry 事件的 error 不带 body, 需从 http.response 捕获) ──
     await ctx.session.hook("http.response", async (evt: any) => {
-      if (evt?.response?.status !== 429) return
       try {
-        const text = await evt.response.clone().text()
-        recent429.set(String(evt.sessionID), { at: Date.now(), text })
-      } catch {}
+        if (evt?.response?.status !== 429) return
+        dbg("[resp-hook] 429:", evt?.model?.providerID, evt?.kind)
+        let text = ""
+        try {
+          text = await evt.response.clone().text()
+          recent429.set(String(evt.sessionID), { at: Date.now(), text })
+        } catch (err) {
+          dbg("[resp-hook] clone/text err:", String(err))
+        }
+        // on-demand: 虚模型链当前跳配额耗尽 → 标记死亡到 reset 时刻, 下次请求改写下一跳。
+        // 整段必须自捕获: http.response hook 在请求管线内运行, 未捕获异常会杀死该请求
+        // 并把原始 429 变形为 unclassified 错误(实测 error{type:"unknown", message:"Invalid Date"}),
+        // 分类/重试/hook 全部失效。
+        const providerID = String(evt?.model?.providerID ?? "")
+        const modelID = String(evt?.model?.id ?? evt?.model?.modelID ?? "")
+        const virtual = chainOf(providerID, modelID)
+        if (virtual && text) {
+          const p = expanded.get(virtual.chain[0].provider ?? "")
+          if (isQuotaText(text, p?.quotaMatch) || isQuotaText(text)) {
+            const st = stateOf(String(evt.sessionID ?? ""))
+            // parseResetAtMs 无匹配返回 NaN(不是 null), ?? 兜不住, 必须 isFinite 显式判
+            const parsed = parseResetAtMs(text, p?.resetExtract)
+            const resetAt = Number.isFinite(parsed)
+              ? parsed
+              : Date.now() + (p?.fallbackWaitMs ?? DEFAULT_FALLBACK_WAIT_MS)
+            markDead(virtual.chain, st, st.lastHop, resetAt + (p?.bufferMs ?? 0))
+            dbg(`[on-demand] 第 ${st.lastHop + 1} 跳配额耗尽, 死亡至 ${new Date(resetAt).toISOString()}`)
+          }
+        }
+      } catch (err) {
+        dbg("[resp-hook] handler ERROR:", String(err?.stack ?? err).slice(0, 200))
+      }
     })
 
     // ── 部件 1b: 轮内精确等待(原生徽标, delay 不封顶) ──
     await ctx.session.hook("retry", async (evt: any) => {
       const sessionID = String(evt?.sessionID ?? "")
       const providerID = String(evt?.model?.providerID ?? "")
+      dbg("[retry-hook] fired:", providerID, String(evt?.error?.type ?? ""), String(evt?.error?.message ?? "").slice(0, 60))
       const p = expanded.get(providerID)
       const type = evt?.error?.type
       const message = String(evt?.error?.message ?? "")
@@ -274,9 +394,13 @@ export default {
               continue
             }
             if (type === "session.step.failed") {
+              dbg("[ev] step.failed:", JSON.stringify(data).slice(0, 300))
               const fid = data?.assistantMessageID
               if (fid) failedAssistant.set(data.sessionID, fid)
               continue
+            }
+            if (type === "session.execution.failed") {
+              dbg("[ev] execution.failed:", JSON.stringify(data).slice(0, 300))
             }
             if (type === "session.execution.interrupted") {
               stopped.add(data.sessionID)

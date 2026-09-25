@@ -2,7 +2,7 @@
 
 逐功能、逐配置项对照 1.x（`plugins/`，opencode 1.18.x 插件 API）与 2.0（`packages/`，opencode 2.0.15 插件 API）两代实现：实现方式的变化、变好/变差/等价、以及未移植项与原因。用于核查**有没有漏掉的功能、改错的业务逻辑、理解歪的需求**。
 
-结论先行：session-reaper 全量对齐；quota-retry 核心对齐（次数无限换实现方式，语义等价，有一处部署约束变化；apiKey 回退与 title 压制已补）；catalog-bridge **全量对齐**（初版"平台缺口"结论是误诊，修正补全范围后已实测工作）；自更新由 2.0 平台原生提供。剩余未移植：on-demand 降级链（G2，待实现）；OPENCODE_SESSION_ID（G3，平台无字段）。
+结论先行：session-reaper 全量对齐；quota-retry 核心对齐（次数无限换实现方式，语义等价，有一处部署约束变化；apiKey 回退与 title 压制已补）；catalog-bridge **全量对齐**（初版"平台缺口"结论是误诊，修正补全范围后已实测工作）；自更新由 2.0 平台原生提供。剩余未移植：OPENCODE_SESSION_ID（G3，平台无字段）。on-demand 降级链（G2）已实现——挂载组改为用户 config 声明一行 stub（2.0 插件 provider.add 进不了 aisdk 通道，见 quota-retry README），链改写/死亡标记走 http hook，Docker 实测同轮 10 秒内自动降级付费通道。
 
 ---
 
@@ -18,7 +18,7 @@
 | 4 | body 提取重置时刻 | `resetExtract` 正则，无时区后缀按 +08:00 | 同（`parseResetAtMs`，一比一移植+单测） | **等价** |
 | 5 | 重试次数无限 | 二进制补丁：等长改写 `maxRetries` 常量（-1 = 无限），macOS 自动重签名，npm 升级后自动重打 | 轮次续命：原生 10 次耗尽 → revert 删（上轮标记/失败记录）→ 空 synthetic 驱动新执行 = 全新 10 次，无限轮 | **语义等价，手段更换**。2.0 出货二进制核心重试逻辑编译为 JSC bytecode，V1 明文锚点补丁路线已实验证明失效。代价见 §1.3 |
 | 6 | 无头退避封顶 `backoffCapMs` | 补丁改常量（V1 起因：无 retry-after 头时指数退避无限翻倍，实测 38s→76s 一路加倍） | 未移植 | **无需移植**：2.0 原生 schedule 是 `exponential('2s') ∩ spaced('10s')`，单跳退避天然封顶 10s，"无限翻倍"在 2.0 不存在 |
-| 7 | on-demand 虚模型降级链 | fetch 注入层逐跳改写 `body.model` 跨 provider 转发 + 换鉴权 + 挂载组自动创建 | 未移植 | **缺口**：2.0 计划用 `aisdk` hook 实现（包装层可替换 LanguageModel）。见 §4-G2 |
+| 7 | on-demand 虚模型降级链 | fetch 注入层逐跳改写 `body.model` 跨 provider 转发 + 换鉴权 + 挂载组自动创建 | 已实现 | **形态变更**：挂载组需在 opencode.jsonc 声明 stub（插件 provider.add 进不了 hook 全通的 aisdk 通道）；链改写走 `http.request` hook，死亡标记走 `http.response` hook。见 §4-G2 |
 | 8 | `/retry-setting` 查询 | `command.execute.before` 本地接管 + reply 哨兵（ignored 消息） | `command.transform` 注册 + `session.synthetic` 零模型回复 | **等价**。V2 用原生命令机制更干净。V1 报告里的"补丁二进制实际值对照"部分在 V2 无对应物（无补丁，N/A），改为轮次语义说明 |
 | 9 | `quota_retry_status` 工具 | registerTool | `tool.transform` | **等价**（新增当前会话轮次显示） |
 | 10 | TUI 可见性 | 无专门处理（原生徽标 + 补丁后次数连续） | 原生徽标（attempt + 倒计时）每轮重置 + 每轮覆写的通知行"quota-retry · 第 N 轮" | **V2 更好**（V1 徽标只在前 5/10 次出现）；差别：V2 每轮 attempt 从头计（1.5 轮语义），V1 连续计数 |
@@ -35,7 +35,7 @@
 | `patch.enabled/maxRetries/backoffCapMs/restore` | —（无补丁） | N/A：2.0 bytecode 补丁不可行；次数无限由轮次续命承担（等效 `maxRetries: -1`），退避封顶由原生 schedule 承担 |
 | — | `maxRounds`（新增，-1 无限） | 轮次上限。默认 -1 = 无限，等价 V1 `patch.maxRetries: -1` 的行为 |
 | — | `serverPort`（新增，默认 18082） | 轮次续命走本地 HTTP revert 的端口。见部署约束 |
-| `onDemandModels[]` | —（未移植） | §4-G2 |
+| `onDemandModels[]` | `onDemandModels[]`（链跳 `baseURL` 必填，链首跳值可省） | §4-G2 |
 
 ### 1.3 轮次续命的代价（相对 V1 补丁方案，如实列出）
 
@@ -96,7 +96,7 @@
 | # | 缺口 | 影响 | 状态/计划 |
 |---|---|---|---|
 | G1 | zhipu apiKey 回退链（Authorization 头 > auth.json） | 智谱用户不配 apiKey 时拿不到精确重置时刻 | **已实现**：`http.request` hook 抓出站 Authorization 头作回退（1.x 的 auth.json 是 1.x 概念，2.0 凭据在 DB；请求头回退覆盖同一用户值） |
-| G2 | on-demand 虚模型降级链 | "现在就跑完"场景（配额耗尽自动切付费 API）不可用 | 2.0 计划用 aisdk hook（包装层替换 LanguageModel，能力已验证存在）。未开始 |
+| G2 | on-demand 虚模型降级链 | 已解决 | aisdk hook 是死通道（promise 插件注册的 language hook 从不触发，实测）；现行方案 = config stub 挂载组 + http.request/response hook 链改写，Docker 实测通过（含同轮降级、非配额不烧链、整链耗尽交轮次续命） |
 | G3 | OPENCODE_SESSION_ID 注入 | 会话内 shell 脚本无法感知 session 身份（便利功能，非核心链路） | 平台缺口（shell 事件无 sessionID），README 已记录；上游补字段即恢复 |
 | G4 | 插件自更新（shared/sync） | 1.x 需要自建节流检查+重装触发 | **无需移植**：2.0 有原生 PluginUpdate 服务（`check`/`update`，24h 节流，npm 后端，`packages/core/src/plugin/update.ts`） |
 | G5 | catalog-bridge 对 config 型 provider | 自定义 provider 元数据补全不可用（V1 主要场景） | 平台缺口；候选：config 补全器（启动前改写 opencode.jsonc，官方加载器自己消费——绕开冻结，但改用户配置文件需谨慎，待用户决策）或提上游 issue |

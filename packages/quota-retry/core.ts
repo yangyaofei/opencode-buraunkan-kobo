@@ -139,3 +139,113 @@ export function stripTrailingEmptyUsers(messages: ReadonlyArray<{ role?: string;
   }
   return changed ? out : null
 }
+
+// ── on-demand 虚模型降级链(1.x onDemandModels 的 2.0 移植) ──
+
+export type OnDemandChainEntry = {
+  provider?: string // 跳的标识(仅用于配额匹配与展示)
+  model: string // 该跳的真实 model id(写入请求体)
+  baseURL: string // 该跳的 API 端点(http.request 改写目标)
+  apiKey?: string // 该跳的鉴权(替换 Authorization)
+  quotaMatch?: string // 该跳的配额特征(缺省用全局)
+}
+
+export type OnDemandModel = {
+  model: string // 虚模型 ID(TUI 模型列表里出现)
+  provider: string // 挂载的 opencode providerID
+  name?: string
+  npm?: string // 自动创建挂载组时用的 SDK 包, 默认 @ai-sdk/openai-compatible
+  providerName?: string // 自动创建挂载组时的分组显示名
+  // 挂载组自身的连接信息(=链首跳的 baseURL/apiKey)。
+  // 2.0 外部插件的重放视图里 config 型 provider 排在后面, 运行时拿不到它们的 settings,
+  // 因此挂载组连接必须显式声明(1.x 是从 config provider 自动继承的)。
+  baseURL?: string // 挂载组自身连接(缺省取链首跳)
+  apiKey?: string
+  chain: OnDemandChainEntry[]
+}
+
+// 校验并展开 onDemandModels: chain 非空、model/provider 必填; 非法条目整条跳过。
+export function expandOnDemand(list: OnDemandModel[] | undefined): OnDemandModel[] {
+  const out: OnDemandModel[] = []
+  for (const m of list ?? []) {
+    if (!m || typeof m.model !== "string" || !m.model) continue
+    if (!m.provider) continue
+    const chain = (m.chain ?? []).filter((h) => h && typeof h.model === "string" && h.model !== "")
+    if (chain.length === 0) continue
+    const okChain = chain.every((h) => typeof h.baseURL === "string" && h.baseURL !== "")
+    if (!okChain && typeof m.baseURL !== "string") continue
+    out.push({ ...m, chain })
+  }
+  return out
+}
+
+// on-demand HTTP 链状态机: deadUntil 记录各跳配额死亡时刻, 选第一个活跳(全死时用最后一跳等原生重试轮次续命重扫)。
+export type ChainState = { deadUntil: Map<number, number> }
+
+export function pickHop(chain: OnDemandChainEntry[], state: ChainState, now = Date.now()): number {
+  for (let i = 0; i < chain.length; i++) {
+    const until = state.deadUntil.get(i) ?? 0
+    if (now >= until) return i
+  }
+  return chain.length - 1
+}
+
+export function markDead(chain: OnDemandChainEntry[], state: ChainState, hop: number, resetAtMs: number) {
+  if (hop < 0 || hop >= chain.length) return
+  state.deadUntil.set(hop, Math.max(state.deadUntil.get(hop) ?? 0, resetAtMs))
+}
+
+// ── provider 凭据读取(opencode.db credential 表, 参考 OpenChamber credential-db.js) ──
+// 2.x 没有 HTTP 路由交回 apiKey; 凭据存 <dataDir>/opencode.db 的 credential 表(明文 JSON)。
+// 表结构以 v2.0.15 packages/core/src/credential/sql.ts 核实: integration_id/value/active/time_updated。
+// 返回 {providerID → apiKey}; 读不到(SQLite 不可用/表不存在)返回 null(调用方回退显式配置)。
+export function readProviderApiKeys(dataDir: string, env: { OPENCODE_DB?: string } = process.env): Record<string, string> | null {
+  let Database: any
+  try {
+    Database = (globalThis as any).Bun !== undefined ? require("bun:sqlite").Database : undefined
+  } catch {
+    Database = undefined
+  }
+  if (!Database) return null
+  const path = require("node:path") as typeof import("node:path")
+  const fs = require("node:fs") as typeof import("node:fs")
+  const configured = (env.OPENCODE_DB ?? "").trim()
+  const dbPath = configured && configured !== ":memory:" ? path.resolve(dataDir, configured) : path.join(dataDir, "opencode.db")
+  if (!fs.existsSync(dbPath)) return null
+  let db: any
+  try {
+    db = new Database(dbPath, { readonly: true } as any)
+    const rows = db
+      .query(
+        "SELECT integration_id, value FROM credential WHERE integration_id IS NOT NULL " +
+          "ORDER BY integration_id, active DESC, time_updated DESC",
+      )
+      .all() as Array<{ integration_id: string; value: string }>
+    const out: Record<string, string> = {}
+    for (const row of rows) {
+      const id = row?.integration_id
+      if (!id || id in out) continue
+      try {
+        const v = JSON.parse(row.value)
+        if (v?.type === "key" && typeof v.key === "string") out[id] = v.key
+      } catch {
+        /* 非 JSON 或非 key 型(如 oauth)跳过 */
+      }
+    }
+    return out
+  } catch {
+    return null
+  } finally {
+    try {
+      db?.close()
+    } catch {
+      /* 只读连接, 关闭失败无影响 */
+    }
+  }
+}
+
+// XDG data 目录(与 opencode 一致): XDG_DATA_HOME 或 ~/.local/share
+export function xdgDataDir(env: { XDG_DATA_HOME?: string; HOME?: string } = process.env): string {
+  if (env.XDG_DATA_HOME && env.XDG_DATA_HOME.trim() !== "") return env.XDG_DATA_HOME
+  return require("node:path").join(env.HOME ?? require("node:os").homedir(), ".local", "share")
+}
