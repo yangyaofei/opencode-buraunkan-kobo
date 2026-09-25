@@ -4,3 +4,4 @@ bun.lockb
 test/.win-*
 test/.real-*
 test/.report-*
+tmp/
