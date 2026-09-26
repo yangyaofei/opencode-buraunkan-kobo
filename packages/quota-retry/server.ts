@@ -53,7 +53,7 @@ type Ctx = {
   location: { directory: string }
   session: {
     hook: (name: string, cb: (evt: any) => any) => Promise<{ dispose: () => Promise<void> }>
-    synthetic: (input: { sessionID: string; text: string; description?: string }) => Promise<unknown>
+    synthetic: (input: { sessionID: string; id?: string; text: string; description?: string }) => Promise<unknown>
   }
   provider: {
     list: () => Promise<ReadonlyArray<any>>
@@ -354,9 +354,13 @@ export default {
         return
       }
       // 空标记: description 前台可见(每轮覆写), text="" 是驱动执行的载体(出口剥掉)。
+      // id 自指定(protocol payload 支持 id, 唯一约束 msg_ 前缀)——标记消息 id 已知,
+      // 无需 export 反查, HTTP 依赖只剩 revert 本身。
+      const markerID = `msg_${MARKER_PREFIX}_r${round}_${Date.now().toString(36)}`
       try {
         await ctx.session.synthetic({
           sessionID,
+          id: markerID,
           text: "",
           description: `${MARKER_PREFIX} · 第 ${round} 轮 · 内部标记(不发给模型)`,
         })
@@ -364,17 +368,7 @@ export default {
         dbg("[round] synthetic FAIL:", String(err?.message ?? err).slice(0, 140))
         return
       }
-      // 插件事件流收不到 session.synthetic(实测), 用 export 捕获标记消息 id 供下轮 stage。
-      try {
-        const exp = await (await fetch(`${apiBase}/api/experimental/session/${sessionID}/export`, { headers: authHeaders() })).json()
-        for (let k = (exp?.data?.messages ?? []).length - 1; k >= 0; k--) {
-          const m = exp.data.messages[k]
-          if (m.type === "synthetic" && String(m.description ?? "").startsWith(MARKER_PREFIX)) {
-            lastMarker.set(sessionID, m.id)
-            break
-          }
-        }
-      } catch {}
+      lastMarker.set(sessionID, markerID)
       console.log(`[quota-retry] ${sessionID} 第 ${round} 轮续命(原生 10 次重试重新计数)`)
     }
 
