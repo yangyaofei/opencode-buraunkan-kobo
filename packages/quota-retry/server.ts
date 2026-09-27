@@ -8,15 +8,14 @@
 //      写 decision = { retry: true, delay }。原生 runner 执行重试, TUI 显示原生
 //      徽标("⚠ Retrying in Ns · attempt N"), 延迟不封顶。
 //   2. 轮次续命 — 原生 10 次耗尽后(core 硬编码 recurs(10)), 从事件流收到
-//      execution.failed: revert 删掉(上轮内部标记 ?? 失败 assistant), 再注入
-//      text="" 的 synthetic 通知行(description = 可见轮次)。空 synthetic 经
-//      inbox 驱动新执行 = 全新 10 次原生重试。无限轮。
+//      execution.failed: 注入 text="" 的 synthetic 通知行(description = 可见
+//      轮次)。空 synthetic 经 inbox 驱动新执行 = 全新 10 次原生重试。无限轮。
+//      代价(已接受): 不删失败现场, 每轮累积一条失败 assistant + 一条标记。
 //   3. 出口净化 — session.http.request hook 剥掉空 synthetic 在出站请求里映射的
-//      尾部空 user 消息, 第 2+ 轮请求与原始 turn 字节级一致。
+//      尾部空 user 消息。
 //
-// 部署约束(README 详述): 部件 2 的 revert 没有插件 API, 走本地 HTTP。要求
-// opencode 以 `OPENCODE_PASSWORD=xxx opencode serve --port <port>` 运行, 客户端
-// (TUI `--server`) 连接该 serve; 插件从环境变量读同一密码。
+// 零进程外依赖: 全部走插件 API(ctx.session/ctx.event)。revert 无插件 API(上游
+// 缺口, 已提 issue), 续命不做消息删除, 用界面噪音换部署自由。
 //
 // 1.x 功能对照:
 //   ✅ 配额识别(quotaMatch/resetExtract/zhipu API 精确重置)
@@ -25,7 +24,7 @@
 //      chunk 是 JSC bytecode, 明文补丁无效 — 已实验证明)
 //   ✅ TUI 可见性(原生徽标 + 每轮覆写的通知行 "quota-retry · 第 N 轮")
 //   ✅ quota_retry_status 工具 / retry-setting 命令(零模型回复)
-//   ❌ on-demand 降级链: 后续版本用 aisdk hook 设计实现
+//   ✅ on-demand 降级链(config stub 挂载组 + http hook 链改写 + 死亡标记)
 
 import { appendFileSync, mkdirSync } from "node:fs"
 import {
@@ -99,13 +98,6 @@ export default {
     const cfg = loadConfig(projectDir)
     const quotaCacheMs = cfg.quotaCacheMs ?? DEFAULT_QUOTA_CACHE_MS
     const maxRounds = cfg.maxRounds ?? Number(process.env.QUOTA_RETRY_MAX_ROUNDS ?? -1)
-    const serverPort = cfg.serverPort ?? Number(process.env.RETRY_SERVER_PORT ?? 18082)
-
-    const apiBase = `http://127.0.0.1:${serverPort}`
-    const authHeaders = () => ({
-      "content-type": "application/json",
-      authorization: "Basic " + Buffer.from("opencode:" + (process.env.OPENCODE_PASSWORD ?? "")).toString("base64"),
-    })
 
     // 运行时 providerID → 配置: setup 时先算一次, 之后按需刷新。
     let expanded = expandProviders(cfg, [])
@@ -133,7 +125,7 @@ export default {
       }
       return credKeys?.[provider] ?? authCache.get(provider)
     }
-    dbg(`[boot] loaded: providers=${(cfg.providers ?? []).length} onDemand=${onDemand.length} maxRounds=${maxRounds}`)
+    dbg(`[boot] loaded: pid=${process.pid} providers=${(cfg.providers ?? []).length} onDemand=${onDemand.length} maxRounds=${maxRounds}`)
     // 挂载组不在此创建: 插件 provider.add 只支持 native 包契约(@opencode/ai/providers/* 的
     // model(modelID, settings) 导出), 而 native 通道不挂插件 http/retry hook 且 2.0.15 有未知缺陷
     // (429 → error{type:"unknown", message:"Invalid Date"}, 分类/重试/hook 全部失效)。
@@ -191,8 +183,6 @@ export default {
     const recent429 = new Map<string, { at: number; text: string }>() // sid -> 最近 429 body
     const zhipuCache = new Map<string, { at: number; resetAt: number }>() // providerID -> 精确重置时刻缓存
     const rounds = new Map<string, number>() // sid -> 当前 turn 已续命轮数
-    const failedAssistant = new Map<string, string>() // sid -> 失败 assistantMessageID(下轮 stage 目标)
-    const lastMarker = new Map<string, string>() // sid -> 上轮 synthetic 标记消息 id(下轮 stage 目标)
     const stopped = new Set<string>() // 用户接管/中断后不再续命
     const quotaHit = new Set<string>() // retry hook 判定过配额的会话(轮次触发条件)
     // providerID -> 出站 Authorization 头(zhipu 配额查询的 apiKey 回退来源, 对齐 1.x)
@@ -200,8 +190,6 @@ export default {
 
     const resetSession = (sid: string) => {
       rounds.delete(sid)
-      failedAssistant.delete(sid)
-      lastMarker.delete(sid)
       stopped.delete(sid)
       quotaHit.delete(sid)
     }
@@ -243,12 +231,8 @@ export default {
     await ctx.session.hook("title", async (evt: any) => {
       const sessionID = String(evt?.sessionID ?? "")
       if (!sessionID || !quotaHit.has(sessionID)) return
-      try {
-        const info = await (await fetch(`${apiBase}/api/session/${sessionID}`, { headers: authHeaders() })).json()
-        const title = info?.data?.title
-        // 续命期间一律跳过 title 重生成: 有标题用标题, 没有就置空(省一次注定 429 的请求)
-        evt.result = typeof title === "string" ? title : ""
-      } catch (e) { dbg("[title] fetch err:", String(e)) }
+      // 一律置空跳过 title 模型请求(续命期间 title 保持原值)
+      evt.result = ""
     })
 
     // ── 部件 1a: 抓 429 body(retry 事件的 error 不带 body, 需从 http.response 捕获) ──
@@ -319,43 +303,11 @@ export default {
       console.log(`[quota-retry] ${providerID} 配额耗尽(attempt=${evt?.attempt}), ${humanWait(delay)}后重试`)
     })
 
-    // ── 部件 2: 轮次续命 — 10 次耗尽 → revert + 空标记 → 新一轮 ──
+    // ── 部件 2: 轮次续命 — 10 次耗尽 → 空标记驱动新一轮(纯插件 API, 零进程外依赖) ──
+    // 代价(已接受): 不删失败现场, 每轮累积一条失败 assistant + 一条标记(界面噪音);
+    // 发给模型的请求由出口 strip 保持干净(空 user 剥除)。
     const redoRound = async (sessionID: string, round: number) => {
-      const target = lastMarker.get(sessionID) ?? failedAssistant.get(sessionID)
-      if (!target) {
-        dbg("[round] no stage target cached, skip")
-        return
-      }
-      // stage 语义 = 删除 messageID 及其后所有。第 1 轮删失败 assistant;
-      // 第 2+ 轮删上一轮标记(连同其后新失败 assistant 一起, 标记恒一条)。
-      let stageRes = await fetch(`${apiBase}/api/session/${sessionID}/revert/stage`, {
-        method: "POST",
-        headers: authHeaders(),
-        body: JSON.stringify({ messageID: target }),
-      })
-      for (let tries = 0; !stageRes.ok && tries < 3; tries++) {
-        await new Promise((r) => setTimeout(r, 150))
-        stageRes = await fetch(`${apiBase}/api/session/${sessionID}/revert/stage`, {
-          method: "POST",
-          headers: authHeaders(),
-          body: JSON.stringify({ messageID: target }),
-        })
-      }
-      if (!stageRes.ok) {
-        dbg("[round] stage FAIL:", stageRes.status, (await stageRes.text()).slice(0, 120))
-        return
-      }
-      const commitRes = await fetch(`${apiBase}/api/session/${sessionID}/revert/commit`, {
-        method: "POST",
-        headers: authHeaders(),
-      })
-      if (commitRes.status !== 204) {
-        dbg("[round] commit FAIL:", commitRes.status)
-        return
-      }
-      // 空标记: description 前台可见(每轮覆写), text="" 是驱动执行的载体(出口剥掉)。
-      // id 自指定(protocol payload 支持 id, 唯一约束 msg_ 前缀)——标记消息 id 已知,
-      // 无需 export 反查, HTTP 依赖只剩 revert 本身。
+      // 空标记: description 前台可见, text="" 是驱动执行的载体(出口剥掉)。
       const markerID = `msg_${MARKER_PREFIX}_r${round}_${Date.now().toString(36)}`
       try {
         await ctx.session.synthetic({
@@ -368,7 +320,6 @@ export default {
         dbg("[round] synthetic FAIL:", String(err?.message ?? err).slice(0, 140))
         return
       }
-      lastMarker.set(sessionID, markerID)
       console.log(`[quota-retry] ${sessionID} 第 ${round} 轮续命(原生 10 次重试重新计数)`)
     }
 
@@ -389,8 +340,6 @@ export default {
             }
             if (type === "session.step.failed") {
               dbg("[ev] step.failed:", JSON.stringify(data).slice(0, 300))
-              const fid = data?.assistantMessageID
-              if (fid) failedAssistant.set(data.sessionID, fid)
               continue
             }
             if (type === "session.execution.failed") {
@@ -467,8 +416,6 @@ export default {
       recent429.clear()
       zhipuCache.clear()
       rounds.clear()
-      failedAssistant.clear()
-      lastMarker.clear()
       stopped.clear()
       quotaHit.clear()
     }

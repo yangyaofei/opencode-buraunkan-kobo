@@ -20,7 +20,7 @@
 - 等待时长不封顶（原生 15 分钟 `RETRY_AFTER_MAX` 上限不适用于 hook 设置的 delay，已实测 16 分钟）。
 - 智谱配额 API（`open.bigmodel.cn/api/monitor/usage/quota/limit`）获取精确重置时刻，带 60s 缓存。
 - 429 body 中提取重置时间（`resetExtract` 正则，无时区后缀按 +08:00 解析，与 1.x 一致）。
-- **轮次续命（无限次数）**：原生 10 次耗尽后，从事件流捕获 `execution.failed`，revert 删掉（上轮内部标记 / 失败 assistant），注入 `text=""` 的 synthetic 通知行（`description = "quota-retry · 第 N 轮 · 内部标记(不发给模型)"`，前台可见、每轮覆写）。空 synthetic 经 inbox 驱动新执行 = 全新 10 次原生重试。无限轮。
+- **轮次续命（无限次数）**：原生 10 次耗尽后，从事件流捕获 `execution.failed`，注入 `text=""` 的 synthetic 通知行（不删失败现场——revert 无插件 API，已提上游 issue）（`description = "quota-retry · 第 N 轮 · 内部标记(不发给模型)"`，前台可见、每轮覆写）。空 synthetic 经 inbox 驱动新执行 = 全新 10 次原生重试。无限轮。
 - **出口净化**：`http.request` hook 剥掉空 synthetic 在出站请求里映射的尾部空 user 消息——第 2+ 轮请求与原始 turn 字节级一致（Docker 实测 45 次 429 全程同 hash、无空消息）。
 - 用户接管：续命过程中用户发新消息自动停止续命让位。
 - `quota_retry_status` 工具 + `/retry-setting` 命令（`ctx.session.synthetic` 零模型回复）。
@@ -74,16 +74,11 @@
 
 **实现要点**：`http.request` hook 链改写 + `http.response` hook 配额死亡标记（`parseResetAtMs` 无匹配返回 `NaN` 而非 `null`，`??` 兜不住，须 `Number.isFinite` 显式判——此 bug 曾让死亡标记静默失效）；http hook 在请求管线内运行，回调内未捕获异常会杀死该请求并把 429 变形为 unclassified 错误，所有分支必须自捕获。
 
-**轮次续命说明**：opencode 2.0.15 出货二进制的核心重试逻辑（`packages/core/src/session/runner/retry.ts`）编译为 JSC bytecode，1.x 的明文锚点补丁路线失效（已实验证明）。替代方案 = 轮次续命：原生 10 次耗尽 → 删失败记录 + 空标记驱动新执行 → 全新 10 次。对模型的请求始终与原始 turn 一致（工具/思考历史完整保留、零重跑）；前台每次重试都是原生徽标（attempt + 倒计时），轮次边界是一行覆写刷新的通知行。
+**轮次续命说明**：opencode 2.0.15 出货二进制的核心重试逻辑（`packages/core/src/session/runner/retry.ts`）编译为 JSC bytecode，1.x 的明文锚点补丁路线失效（已实验证明）。替代方案 = 轮次续命：原生 10 次耗尽 → 空标记驱动新执行 → 全新 10 次。前台每次重试都是原生徽标（attempt + 倒计时），轮次边界是一行通知行；发给模型的请求由出口净化保持干净（空标记映射的空 user 消息被剥除）。
 
-**部署约束（重要）**：轮次续命的 revert 没有插件 API（2.0.15 插件 session 域无 remove/revert），只能走本地 HTTP。要求 opencode 以固定端口 + 密码运行 serve，客户端连它：
+**已知代价（纯插件 API 的取舍）**：revert 没有插件 API（2.0.15 插件 session 域无 remove/revert，已提上游 issue），续命不删失败现场——每轮累积一条失败 assistant 和一条轮次标记（10 轮 ≈ 消息列表多 20 条记录，界面噪音）；不影响功能，工具/思考历史完整保留。
 
-```bash
-OPENCODE_PASSWORD=xxx opencode serve --port 18082     # 服务端(本机)
-opencode --server http://127.0.0.1:18082              # TUI/客户端
-```
-
-插件从 `OPENCODE_PASSWORD` 环境变量读同一密码（serve 进程内可见）。端口可用配置 `serverPort` 或环境变量 `RETRY_SERVER_PORT` 覆盖（默认 18082）。不满足此约束时轮内精确等待仍然工作，只有轮次续命不可用。
+**零进程外依赖**：全部走插件 API（`ctx.session`/`ctx.event`），无端口/密码/HTTP 约束，任何部署方式（serve / service / TUI / 托管）行为一致。
 
 ## 配置
 
@@ -102,8 +97,7 @@ opencode --server http://127.0.0.1:18082              # TUI/客户端
     }
   ],
   "quotaCacheMs": 60000,
-  "maxRounds": -1,
-  "serverPort": 18082
+  "maxRounds": -1
 }
 ```
 

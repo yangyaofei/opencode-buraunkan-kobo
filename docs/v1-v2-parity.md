@@ -34,7 +34,7 @@
 | `quotaCacheMs` | 同 | 一致 |
 | `patch.enabled/maxRetries/backoffCapMs/restore` | —（无补丁） | N/A：2.0 bytecode 补丁不可行；次数无限由轮次续命承担（等效 `maxRetries: -1`），退避封顶由原生 schedule 承担 |
 | — | `maxRounds`（新增，-1 无限） | 轮次上限。默认 -1 = 无限，等价 V1 `patch.maxRetries: -1` 的行为 |
-| — | `serverPort`（新增，默认 18082） | 轮次续命走本地 HTTP revert 的端口。见部署约束 |
+| — | — | serverPort 已移除：续命改为纯插件 API（synthetic 驱动），零进程外依赖 |
 | `onDemandModels[]` | `onDemandModels[]`（链跳 `baseURL` 必填，链首跳值可省） | §4-G2 |
 
 ### 1.3 轮次续命的代价（相对 V1 补丁方案，如实列出）
