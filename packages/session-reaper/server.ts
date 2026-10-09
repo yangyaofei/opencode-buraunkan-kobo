@@ -34,65 +34,24 @@ type Ctx = {
   command: { transform: (cb: (editor: { add: (def: any) => void }) => void) => Promise<unknown> }
 }
 
-// 会话删除优先用插件原生 API ctx.session.remove(opencode >= 2.0.24): 进程内直调,
-// 任何部署方式都可用。旧版本(无 remove)回退到子进程 CLI —— `opencode session delete`
-// 连后台服务(与用户手动删除同一链路), 配置 deleteServer 时改连指定服务端。
+// 会话删除走插件原生 API ctx.session.remove(opencode >= 2.0.24 起插件 session 域暴露 remove):
+// 进程内直调、递归删子会话、任何部署方式都可用, 无子进程、无密码/端口依赖。
 // "not found" 视为已清理(幂等); 其余失败返回 false 保留在桶中下次重试。
-async function deleteSession(
-  ctx: Ctx,
-  sessionID: string,
-  deleteServer?: string,
-): Promise<boolean> {
+async function deleteSession(ctx: Ctx, sessionID: string): Promise<boolean> {
   const remove = ctx.session?.remove
-  if (typeof remove === "function") {
-    try {
-      await remove({ sessionID })
-      return true
-    } catch (err: any) {
-      const msg = String(err?.message ?? err)
-      if (/not found|notfound|404/i.test(msg)) return true
-      console.error(`[session-reaper] ctx.session.remove ${sessionID} failed: ${msg.slice(0, 200)}`)
-      return false
-    }
+  if (typeof remove !== "function") {
+    console.error(`[session-reaper] ctx.session.remove 不可用(opencode < 2.0.24), 跳过删除 ${sessionID}`)
+    return false
   }
-  return await deleteSessionViaCli(sessionID, 20_000, deleteServer)
-}
-
-async function deleteSessionViaCli(
-  sessionID: string,
-  timeoutMs = 20_000,
-  deleteServer?: string,
-): Promise<boolean> {
-  const { spawn } = await import("node:child_process")
-  const bin = process.execPath
-  const args = ["session", "delete"]
-  if (deleteServer) args.push("--server", deleteServer)
-  args.push(sessionID)
-  return await new Promise<boolean>((resolve) => {
-    const child = spawn(bin, args, {
-      stdio: ["ignore", "pipe", "pipe"],
-    })
-    let stderr = ""
-    child.stdout.on("data", () => {})
-    child.stderr.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString("utf8")
-    })
-    const timer = setTimeout(() => {
-      child.kill("SIGKILL")
-      resolve(false)
-    }, timeoutMs)
-    child.on("error", () => {
-      clearTimeout(timer)
-      resolve(false)
-    })
-    child.on("close", (code) => {
-      clearTimeout(timer)
-      if (code === 0) return resolve(true)
-      if (/not found|notfound|404/i.test(stderr)) return resolve(true)
-      console.error(`[session-reaper] delete ${sessionID} failed (exit=${code}): ${stderr.trim().slice(0, 200)}`)
-      resolve(false)
-    })
-  })
+  try {
+    await remove({ sessionID })
+    return true
+  } catch (err: any) {
+    const msg = String(err?.message ?? err)
+    if (/not found|notfound|404/i.test(msg)) return true
+    console.error(`[session-reaper] ctx.session.remove ${sessionID} failed: ${msg.slice(0, 200)}`)
+    return false
+  }
 }
 
 async function reapPipeline(
@@ -106,7 +65,7 @@ async function reapPipeline(
   const reaped: Entry[] = []
   const failed: Entry[] = []
   for (const e of [...expired, ...overflow]) {
-    if (await deleteSession(ctx, e.id, cfg.deleteServer)) reaped.push(e)
+    if (await deleteSession(ctx, e.id)) reaped.push(e)
     else failed.push(e)
   }
   return { expired, overflow, reaped, failed, survivors }

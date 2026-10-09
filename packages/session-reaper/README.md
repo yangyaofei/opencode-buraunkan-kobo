@@ -27,7 +27,7 @@ registry 落 `~/.local/state/opencode/session-reaper/registry.json`（XDG_STATE_
 
 ## 与 1.x 的差异
 
-- **会话删除**：优先用插件原生 `ctx.session.remove({ sessionID })`（opencode ≥ 2.0.24 起插件 session 域暴露 remove，进程内直调、递归删子会话，任何部署方式都可用）。旧版本（无 `remove`）自动回退到子进程 `opencode session delete [--server <url>] <sessionID>`（与用户手动删除同链路；默认连后台服务，配置 `deleteServer` 指定目标）。删除失败（404/`not found`）视为已删（幂等），其他失败保留会话待下次收割。
+- **会话删除**：用插件原生 `ctx.session.remove({ sessionID })`（opencode ≥ 2.0.24 起插件 session 域暴露 remove），进程内直调、递归删子会话，任何部署方式都可用，无子进程、无密码/端口依赖。**要求 opencode ≥ 2.0.24**（更低版本删除会失败并保留会话，其他功能不受影响）。删除失败（404/`not found`）视为已删（幂等），其他失败保留会话待下次收割。
 - **环境注入**：1.x 通过 `shell.env` hook 注入 `OPENCODE_SESSION_ID`；2.0 的 shell hook 无 sessionID 维度，已放弃（辅助功能）。
 - **零模型回复**：1.x 用 `noReply` + ignored parts + 哨兵异常 hack；2.0 用官方 `ctx.session.synthetic`。
 
@@ -42,7 +42,6 @@ registry 落 `~/.local/state/opencode/session-reaper/registry.json`（XDG_STATE_
 ```jsonc
 {
   "defaultKeepDays": 30,     // 默认保留天数（桶内未显式配置时）
-  "deleteServer": "http://127.0.0.1:18082",  // 可选, 删除命令的目标服务端
   "pipelines": {
     "my-pipeline": { "keepDays": 7, "maxSessions": 5 }
   }
@@ -58,4 +57,4 @@ registry 落 `~/.local/state/opencode/session-reaper/registry.json`（XDG_STATE_
 ## 测试
 
 - `bun test packages/session-reaper`（30 单测：parseArgs/effectiveRule/planReap/statusReport/parseJsonc）
-- Docker 集成 15/15：命令分派、set 落盘、run re-drive、子进程删除（404 幂等）、registry/log 校验
+- Docker 集成 15/15：命令分派、set 落盘、run re-drive、删除（404 幂等）、registry/log 校验

@@ -23,10 +23,6 @@ export type ReaperConfig = {
   defaultKeepDays?: number
   defaultMaxSessions?: number
   logKeep?: number
-  /** 可选: 指定删除会话时连接的服务端(如 http://127.0.0.1:14099)。
-   *  缺省走后台服务发现(与用户手动 `opencode session delete` 一致)。
-   *  指定时需配套环境变量 OPENCODE_PASSWORD 提供该服务端密码。 */
-  deleteServer?: string
   pipelines?: Record<string, PipelineRule>
 }
 export type Entry = { id: string; created: number }

@@ -58,7 +58,7 @@
 | 2 | `status` / `set` / `reap` 零模型路径 | reply 哨兵（ignored 消息 + 抛异常截断） | `session.synthetic` 零模型回复 | **等价**。V2 已知平台行为：同一会话连续多条 synthetic 时后续条目滞留 inbox、下次 agent 运行时显示（不丢，README 已记录） |
 | 3 | 删除顺序：keepDays 过期 → maxSessions 溢出（最老先删） | 进程内逐条 | `planReap` 纯函数（单测覆盖 4 场景） | **等价** |
 | 4 | maxSessions 语义 = 保留历史条数（本次 run 不参与裁剪，桶内 N+1） | ✓ | ✓（register 在 reap 后，语义一致） | **等价**（易错点已核对） |
-| 5 | 删除失败留桶重试 / 404 幂等 | DELETE `/session/:id` 进程内 fetch | 优先 `ctx.session.remove({sessionID})`（opencode ≥ 2.0.24 插件 session 域已暴露 remove）；旧版本回退 `spawn(opencode session delete)` 子进程（stderr 404/not found 视为已删） | **等价且更优**：新版本进程内直调、无子进程、任何部署方式可用（Docker 实测 15/15 为子进程路径） |
+| 5 | 删除失败留桶重试 / 404 幂等 | DELETE `/session/:id` 进程内 fetch | `ctx.session.remove({sessionID})`（opencode ≥ 2.0.24 插件 session 域已暴露 remove；更低版本会失败并保留会话） | **等价且更优**：进程内直调、递归删子会话、无子进程、无密码/端口依赖，任何部署方式可用 |
 | 6 | 级联删除 subagent 子会话 | DELETE 端点内建 | 同（`session.remove` 递归删子会话，CLI 调它） | **等价** |
 | 7 | registry 损坏自愈 | rename `.corrupt-*` 重建 | 同 | **等价** |
 | 8 | 行为日志 log.jsonl（logKeep 条） | ✓ | ✓（字段结构一致：ts/event/pipeline/registered/expired/overflow/reaped/failed/bucket/change） | **等价** |
@@ -70,7 +70,6 @@
 | V1 | V2 | 说明 |
 |---|---|---|
 | `defaultKeepDays` / `defaultMaxSessions` / `pipelines.{name}.keepDays/maxSessions` / `logKeep` / `registryPath` | 同名同义 | 一致；未配置 default 时只登记不清理（安全默认）一致 |
-| — | `deleteServer`（新增） | 可选：**仅旧版本回退路径**（无 `ctx.session.remove` 时）指定删除时连接的 serve 地址；缺省走后台服务发现。opencode ≥ 2.0.24 走原生 `remove`，此项不需要 |
 
 ---
 
