@@ -18,13 +18,27 @@ export type ProviderConfig = {
   apiKey?: string
 }
 
+// 续命(轮次)触发策略: 原生 10 次耗尽后, 哪些失败应该再开一轮。
+// 默认对齐 1.x `maxRetries=-1` 的语义 —— opencode 原生会重试的那一类错误, 耗尽后继续。
+export type ContinuePolicy = {
+  // 错误类型白名单(opencode SessionError.Error.type), 覆盖默认集合。
+  types?: string[]
+  // HTTP 状态码白名单。缺省 = 429 与全部 5xx(500-599)。
+  // 例如"某些 400 也要重试"就写进这里, 或用 match 正则。
+  statuses?: number[]
+  // 显式拒绝的类型, 优先级最高(鉴权/内容策略/非法请求/不支持/无路由)。
+  denyTypes?: string[]
+  // 消息文本正则: 命中则续命(用于按错误文本列举的场景)。
+  match?: string
+}
+
 export type PluginConfig = {
   providers?: ProviderConfig[]
   quotaCacheMs?: number
   // 轮次续命的轮数上限; -1 = 不限(默认)。每轮 = 原生 10 次重试。
   maxRounds?: number
-  // opencode serve 的本地端口(revert 无插件 API, 只能走 HTTP; 见 README 部署约束)。
-  serverPort?: number
+  // 续命触发策略(默认: 可重试错误类型 + 429/5xx)。
+  continueOn?: ContinuePolicy
 }
 
 export const DEFAULT_QUOTA_URL = "https://open.bigmodel.cn/api/monitor/usage/quota/limit"
@@ -121,19 +135,82 @@ export async function zhipuResetAtMs(
   }
 }
 
-// 出站请求体净化: 剥掉尾部"轮次标记"映射出的空 user 消息, 让第 2+ 轮请求与
-// 原始 turn 字节级一致。空 = content 为空字符串或空数组(OpenAI 兼容两种形态)。
+// 轮次标记的文本前缀。标记的 text = 前缀 + 随机 token: 既让出站过滤能精确识别
+// "这必然是我们注入的"(不靠"空字符串"这种可能撞上真实用户输入的判据), 也让它在
+// session DB / 日志里一眼可辨。
+export const MARKER_TEXT_PREFIX = "quota-retry-round-"
+
+// 续命默认可续的错误类型 = opencode 原生 isRetryable 的那一组
+// (RateLimit/ProviderInternal/Transport/InvalidProviderOutput/UnknownProvider + 插件翻转的 Quota)
+export const DEFAULT_CONTINUE_TYPES = [
+  "provider.quota",
+  "provider.rate-limit",
+  "provider.internal",
+  "provider.transport",
+  "provider.invalid-output",
+  "provider.unknown",
+]
+// 永远不续命的类型: 鉴权/内容策略/非法请求/不支持/无路由 —— 重试无意义。
+export const DEFAULT_CONTINUE_DENY_TYPES = [
+  "provider.auth",
+  "provider.content-filter",
+  "provider.invalid-request",
+  "provider.unsupported-operation",
+  "provider.no-route",
+]
+
+// 续命判定: deny 优先; 其次类型白名单; 其次状态码(缺省 429 + 5xx); 最后正则。
+export function shouldContinue(
+  error: { type?: string; status?: number; message?: string } | undefined | null,
+  policy?: ContinuePolicy,
+): boolean {
+  if (!error) return false
+  const type = String(error.type ?? "")
+  if (type && (policy?.denyTypes ?? DEFAULT_CONTINUE_DENY_TYPES).includes(type)) return false
+  if (type && (policy?.types ?? DEFAULT_CONTINUE_TYPES).includes(type)) return true
+  const status = Number(error.status)
+  if (Number.isFinite(status)) {
+    const statuses = policy?.statuses
+    if (statuses) {
+      if (statuses.includes(status)) return true
+    } else if (status === 429 || (status >= 500 && status <= 599)) {
+      return true
+    }
+  }
+  if (policy?.match) {
+    try {
+      if (new RegExp(policy.match, "i").test(String(error.message ?? ""))) return true
+    } catch {}
+  }
+  return false
+}
+
+// 判定一条 content 是不是本插件注入的标记: 字符串直接看前缀; parts 形态要求
+// 全部文本 part 都带前缀(避免把用户真实消息误判为标记)。
+export function isMarkerText(content: unknown, prefix: string = MARKER_TEXT_PREFIX): boolean {
+  if (typeof content === "string") return content.startsWith(prefix)
+  if (Array.isArray(content)) {
+    const texts = content.filter(
+      (part): part is { type: string; text: string } =>
+        Boolean(part) && typeof part === "object" && (part as { type?: string }).type === "text",
+    )
+    return texts.length > 0 && texts.every((part) => typeof part.text === "string" && part.text.startsWith(prefix))
+  }
+  return false
+}
+
+// 出站请求体净化: 剥掉尾部"轮次标记"映射出的 user 消息, 让第 2+ 轮请求与原始
+// turn 字节级一致。只认标记文本前缀, 不按"空"判定(空 user 可能是用户真的发了 "")。
 // 返回新数组; 无需剥离时返回 null(调用方保持原请求不动)。
-export function stripTrailingEmptyUsers(messages: ReadonlyArray<{ role?: string; content?: unknown }>): unknown[] | null {
+export function stripTrailingMarkerUsers(
+  messages: ReadonlyArray<{ role?: string; content?: unknown }>,
+  prefix: string = MARKER_TEXT_PREFIX,
+): unknown[] | null {
   const out = [...messages]
   let changed = false
   while (out.length > 0) {
     const last = out[out.length - 1] as { role?: string; content?: unknown }
-    const isEmptyUser =
-      last != null &&
-      last.role === "user" &&
-      (last.content === "" || (Array.isArray(last.content) && last.content.length === 0))
-    if (!isEmptyUser) break
+    if (!last || last.role !== "user" || !isMarkerText(last.content, prefix)) break
     out.pop()
     changed = true
   }

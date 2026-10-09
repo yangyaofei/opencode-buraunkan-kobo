@@ -20,8 +20,9 @@
 - 等待时长不封顶（原生 15 分钟 `RETRY_AFTER_MAX` 上限不适用于 hook 设置的 delay，已实测 16 分钟）。
 - 智谱配额 API（`open.bigmodel.cn/api/monitor/usage/quota/limit`）获取精确重置时刻，带 60s 缓存。
 - 429 body 中提取重置时间（`resetExtract` 正则，无时区后缀按 +08:00 解析，与 1.x 一致）。
-- **轮次续命（无限次数）**：原生 10 次耗尽后，从事件流捕获 `execution.failed`，注入 `text=""` 的 synthetic 通知行（不删失败现场——revert 无插件 API，已提上游 issue）（`description = "quota-retry · 第 N 轮 · 内部标记(不发给模型)"`，前台可见、每轮覆写）。空 synthetic 经 inbox 驱动新执行 = 全新 10 次原生重试。无限轮。
-- **出口净化**：`http.request` hook 剥掉空 synthetic 在出站请求里映射的尾部空 user 消息——第 2+ 轮请求与原始 turn 字节级一致（Docker 实测 45 次 429 全程同 hash、无空消息）。
+- **轮次续命（无限次数）**：原生 10 次耗尽后，从事件流捕获 `execution.failed`，注入一条 synthetic 通知行驱动新执行（= 全新 10 次原生重试，无限轮）。标记的 `text = "quota-retry-round-" + 随机 token`（出口按前缀精确剥除），`description = "quota-retry · 第 N 轮"` 前台可见，消息 `id` 由插件自指定（`msg_quota-retry_rN_xxx`）。不删失败现场——revert 无插件 API，已提上游 issue。
+- **续命触发可配置**（`continueOn`）：默认对齐 1.x `maxRetries=-1` 的语义——opencode 原生会重试的那一类错误（`provider.quota` / `provider.rate-limit` / `provider.internal` / `provider.transport` / `provider.invalid-output` / `provider.unknown`）以及 429 + 全部 5xx；`denyTypes`（默认 auth / content-filter / invalid-request / unsupported-operation / no-route）一票否决；可用 `types` / `statuses` / `match` 正则覆盖默认（例如让某些 400 也续命）。
+- **出口净化**：`http.request` hook 剥掉尾部"轮次标记"映射出的 user 消息——**按标记文本前缀判定，不按"空"判定**（空 user 可能是用户真的发了空串）。第 2+ 轮请求与原始 turn 字节级一致（Docker 实测 45 次 429 全程同 hash、无残留标记消息）。
 - 用户接管：续命过程中用户发新消息自动停止续命让位。
 - `quota_retry_status` 工具 + `/retry-setting` 命令（`ctx.session.synthetic` 零模型回复）。
 
@@ -74,9 +75,9 @@
 
 **实现要点**：`http.request` hook 链改写 + `http.response` hook 配额死亡标记（`parseResetAtMs` 无匹配返回 `NaN` 而非 `null`，`??` 兜不住，须 `Number.isFinite` 显式判——此 bug 曾让死亡标记静默失效）；http hook 在请求管线内运行，回调内未捕获异常会杀死该请求并把 429 变形为 unclassified 错误，所有分支必须自捕获。
 
-**轮次续命说明**：opencode 2.0.15 出货二进制的核心重试逻辑（`packages/core/src/session/runner/retry.ts`）编译为 JSC bytecode，1.x 的明文锚点补丁路线失效（已实验证明）。替代方案 = 轮次续命：原生 10 次耗尽 → 空标记驱动新执行 → 全新 10 次。前台每次重试都是原生徽标（attempt + 倒计时），轮次边界是一行通知行；发给模型的请求由出口净化保持干净（空标记映射的空 user 消息被剥除）。
+**轮次续命说明**：opencode 2.0.15 出货二进制的核心重试逻辑（`packages/core/src/session/runner/retry.ts`）编译为 JSC bytecode，1.x 的明文锚点补丁路线失效（已实验证明）。替代方案 = 轮次续命：原生 10 次耗尽 → 标记 synthetic 驱动新执行 → 全新 10 次。前台每次重试都是原生徽标（attempt + 倒计时），轮次边界是一行通知行；发给模型的请求由出口净化保持干净（标记文本按前缀被剥除）。
 
-**已知代价（纯插件 API 的取舍）**：revert 没有插件 API（2.0.15 插件 session 域无 remove/revert，已提上游 issue），续命不删失败现场——每轮累积一条失败 assistant 和一条轮次标记（10 轮 ≈ 消息列表多 20 条记录，界面噪音）；不影响功能，工具/思考历史完整保留。
+**已知代价（纯插件 API 的取舍）**：revert 没有插件 API（2.0.15 插件 session 域无 remove/revert，已提上游 issue），续命不删失败现场——每轮累积一条失败 assistant 和一条轮次标记（10 轮 ≈ 消息列表多 20 条记录，界面噪音）；不影响功能，工具/思考历史完整保留。发给模型的请求不受影响（标记被剥除，失败 assistant 无内容不入请求）。
 
 **零进程外依赖**：全部走插件 API（`ctx.session`/`ctx.event`），无端口/密码/HTTP 约束，任何部署方式（serve / service / TUI / 托管）行为一致。
 
@@ -97,9 +98,19 @@
     }
   ],
   "quotaCacheMs": 60000,
-  "maxRounds": -1
+  "maxRounds": -1,
+  // 续命触发策略(可选; 缺省 = 可重试类型 + 429/5xx)
+  "continueOn": {
+    "types": ["provider.quota", "provider.rate-limit", "provider.internal", "provider.transport"],
+    "statuses": [429, 500, 502, 503, 504],
+    "denyTypes": ["provider.auth", "provider.content-filter"],
+    "match": "rate limited|endpoint is unavailable"   // 某些 400/自定义文案也续命
+  }
 }
 ```
+
+- `continueOn.types` / `statuses` / `match` 任一命中即续命；`denyTypes` 优先（默认含 auth/content-filter/invalid-request/unsupported-operation/no-route）。要在默认 deny 的类型上续命，需显式把它从 `denyTypes` 移除（如 `"denyTypes": []`）。
+- `continueOn.statuses` 缺省 = 429 与全部 5xx。
 
 ## 安装
 
@@ -114,5 +125,5 @@
 
 ## 测试
 
-- `bun test packages/quota-retry`（19 单测）
+- `bun test ./packages/quota-retry`（37 单测）
 - Docker 集成：mock 429 场景验证 12-hit 重试链、delay 采纳、16 分钟封顶突破（见 `tmp/dockerbuild/`）

@@ -16,7 +16,7 @@
 | 2 | 精确等待（配额重置时刻） | 往 429 响应注入 `retry-after-ms` 头交还，骗原生重试机制 | `decision = { retry: true, delay }` 直写重试决策 | **更好**。无 header 欺骗；delay 不封顶（原生 `RETRY_AFTER_MAX` 15 分钟只封 provider 头，hook 值不封，已实测 16 分钟+） |
 | 3 | 智谱配额 API 精确重置 | apiKey 解析链：显式配置 > 本次请求 Authorization 头 > auth.json | 仅显式 `apiKey` | **缺口**：请求头回退可补（`http.request` hook 可见出站头）；auth.json 是 1.x 概念，2.0 等价物待查。见 §4-G1 |
 | 4 | body 提取重置时刻 | `resetExtract` 正则，无时区后缀按 +08:00 | 同（`parseResetAtMs`，一比一移植+单测） | **等价** |
-| 5 | 重试次数无限 | 二进制补丁：等长改写 `maxRetries` 常量（-1 = 无限），macOS 自动重签名，npm 升级后自动重打 | 轮次续命：原生 10 次耗尽 → revert 删（上轮标记/失败记录）→ 空 synthetic 驱动新执行 = 全新 10 次，无限轮 | **语义等价，手段更换**。2.0 出货二进制核心重试逻辑编译为 JSC bytecode，V1 明文锚点补丁路线已实验证明失效。代价见 §1.3 |
+| 5 | 重试次数无限 | 二进制补丁：等长改写 `maxRetries` 常量（-1 = 无限），macOS 自动重签名，npm 升级后自动重打 | 轮次续命：原生 10 次耗尽 → 标记 synthetic 驱动新执行 = 全新 10 次，无限轮 | **语义等价，手段更换**。2.0 出货二进制核心重试逻辑编译为 JSC bytecode，V1 明文锚点补丁路线已实验证明失效。续命触发默认对齐 V1（可重试类型 + 429/5xx），可用 `continueOn` 收窄/放宽（V1 是"任何可重试错误"都无限）。代价见 §1.3 |
 | 6 | 无头退避封顶 `backoffCapMs` | 补丁改常量（V1 起因：无 retry-after 头时指数退避无限翻倍，实测 38s→76s 一路加倍） | 未移植 | **无需移植**：2.0 原生 schedule 是 `exponential('2s') ∩ spaced('10s')`，单跳退避天然封顶 10s，"无限翻倍"在 2.0 不存在 |
 | 7 | on-demand 虚模型降级链 | fetch 注入层逐跳改写 `body.model` 跨 provider 转发 + 换鉴权 + 挂载组自动创建 | 已实现 | **形态变更**：挂载组需在 opencode.jsonc 声明 stub（插件 provider.add 进不了 hook 全通的 aisdk 通道）；链改写走 `http.request` hook，死亡标记走 `http.response` hook。见 §4-G2 |
 | 8 | `/retry-setting` 查询 | `command.execute.before` 本地接管 + reply 哨兵（ignored 消息） | `command.transform` 注册 + `session.synthetic` 零模型回复 | **等价**。V2 用原生命令机制更干净。V1 报告里的"补丁二进制实际值对照"部分在 V2 无对应物（无补丁，N/A），改为轮次语义说明 |
@@ -34,15 +34,17 @@
 | `quotaCacheMs` | 同 | 一致 |
 | `patch.enabled/maxRetries/backoffCapMs/restore` | —（无补丁） | N/A：2.0 bytecode 补丁不可行；次数无限由轮次续命承担（等效 `maxRetries: -1`），退避封顶由原生 schedule 承担 |
 | — | `maxRounds`（新增，-1 无限） | 轮次上限。默认 -1 = 无限，等价 V1 `patch.maxRetries: -1` 的行为 |
+| — | `continueOn`（新增） | 续命触发策略：`types`/`statuses`/`match` 命中即续命，`denyTypes` 一票否决。默认 = 可重试类型 + 429/5xx（对齐 V1"任何可重试错误"语义）；例如让 503 `provider.internal`（exo-free 场景）或某些 400 也续命 |
 | — | — | serverPort 已移除：续命改为纯插件 API（synthetic 驱动），零进程外依赖 |
 | `onDemandModels[]` | `onDemandModels[]`（链跳 `baseURL` 必填，链首跳值可省） | §4-G2 |
 
 ### 1.3 轮次续命的代价（相对 V1 补丁方案，如实列出）
 
-1. **部署约束（唯一的硬约束）**：revert 没有 2.0 插件 API（session 域无 remove/revert），只能走本地 HTTP。要求 `OPENCODE_PASSWORD=xxx opencode serve --port <port>` + 客户端 `--server` 连接。不满足时轮内精确等待仍工作，只有轮次续命不可用。V1 无此约束（但 V1 要碰二进制、opencode 升级即失效需重打）。
-2. **轮次边界约 0.3-0.5s 空档**：失败落地 → 2 次 revert 调用 + 1 次标记注入 → 新执行启动。机制固有（执行真结束+新执行真启动），V1 无空档（同一执行内连续重试）。
-3. **每轮边界多一个 title 重生成请求**（synthetic 驱动新执行触发，约 1 次 msgs=2 小请求）。可用 title hook 压制（待办）。
+1. **失败现场不删除（唯一实质代价）**：revert 没有 2.0 插件 API（session 域无 remove/revert），续命不删上轮失败记录 → 每轮累积一条失败 assistant + 一条标记（10 轮 ≈ 多 20 条记录，界面噪音）。已提上游 issue #51599。V1 无此问题（同一执行内连续重试，无轮次概念）。不影响模型上下文：标记在出口被剥除、失败 assistant 无内容不入请求（Docker 实测 45×429 全程同 hash）。
+2. **轮次边界约 0.3-0.5s 空档**：失败落地 → 标记注入 → 新执行启动。机制固有（执行真结束+新执行真启动），V1 无空档（同一执行内连续重试）。
+3. **每轮边界多一个 title 重生成请求**（synthetic 驱动新执行触发，约 1 次 msgs=2 小请求）。已用 title hook 压制（续命期间跳过 title 重生成，G6）。
 4. **attempt 每轮从 1 重计**（V1 补丁后连续计数）。用户已确认此语义可接受（"我要看到第二轮的 attempt 2"）。
+5. **续命触发是显式策略**（`continueOn`）：默认 = 可重试类型（quota/rate-limit/internal/transport/invalid-output/unknown）+ 429/5xx，`denyTypes` 排除 auth/content-filter/invalid-request/unsupported-operation/no-route；可用 `types`/`statuses`/`match` 覆盖。V1 补丁是"任何原生可重试错误"都无限重试 —— 默认已对齐该语义。
 
 ---
 
@@ -56,7 +58,7 @@
 | 2 | `status` / `set` / `reap` 零模型路径 | reply 哨兵（ignored 消息 + 抛异常截断） | `session.synthetic` 零模型回复 | **等价**。V2 已知平台行为：同一会话连续多条 synthetic 时后续条目滞留 inbox、下次 agent 运行时显示（不丢，README 已记录） |
 | 3 | 删除顺序：keepDays 过期 → maxSessions 溢出（最老先删） | 进程内逐条 | `planReap` 纯函数（单测覆盖 4 场景） | **等价** |
 | 4 | maxSessions 语义 = 保留历史条数（本次 run 不参与裁剪，桶内 N+1） | ✓ | ✓（register 在 reap 后，语义一致） | **等价**（易错点已核对） |
-| 5 | 删除失败留桶重试 / 404 幂等 | DELETE `/session/:id` 进程内 fetch | `spawn(opencode session delete)` 子进程（与用户手动删除同链路；stderr 404/not found 视为已删） | **等价**（Docker 实测 15/15）。原因：2.0 插件 session 域无 remove，`OPENCODE_SERVER_PASSWORD` 对插件进程不可见；CLI 子进程是唯一官方链路 |
+| 5 | 删除失败留桶重试 / 404 幂等 | DELETE `/session/:id` 进程内 fetch | 优先 `ctx.session.remove({sessionID})`（opencode ≥ 2.0.24 插件 session 域已暴露 remove）；旧版本回退 `spawn(opencode session delete)` 子进程（stderr 404/not found 视为已删） | **等价且更优**：新版本进程内直调、无子进程、任何部署方式可用（Docker 实测 15/15 为子进程路径） |
 | 6 | 级联删除 subagent 子会话 | DELETE 端点内建 | 同（`session.remove` 递归删子会话，CLI 调它） | **等价** |
 | 7 | registry 损坏自愈 | rename `.corrupt-*` 重建 | 同 | **等价** |
 | 8 | 行为日志 log.jsonl（logKeep 条） | ✓ | ✓（字段结构一致：ts/event/pipeline/registered/expired/overflow/reaped/failed/bucket/change） | **等价** |
@@ -68,7 +70,7 @@
 | V1 | V2 | 说明 |
 |---|---|---|
 | `defaultKeepDays` / `defaultMaxSessions` / `pipelines.{name}.keepDays/maxSessions` / `logKeep` / `registryPath` | 同名同义 | 一致；未配置 default 时只登记不清理（安全默认）一致 |
-| — | `deleteServer`（新增） | 可选：指定删除时连接的 serve 地址（与 quota-retry 的 serve 部署配合；缺省走后台服务发现） |
+| — | `deleteServer`（新增） | 可选：**仅旧版本回退路径**（无 `ctx.session.remove` 时）指定删除时连接的 serve 地址；缺省走后台服务发现。opencode ≥ 2.0.24 走原生 `remove`，此项不需要 |
 
 ---
 
@@ -101,6 +103,7 @@
 | G4 | 插件自更新（shared/sync） | 1.x 需要自建节流检查+重装触发 | **无需移植**：2.0 有原生 PluginUpdate 服务（`check`/`update`，24h 节流，npm 后端，`packages/core/src/plugin/update.ts`） |
 | G5 | catalog-bridge 对 config 型 provider | 自定义 provider 元数据补全不可用（V1 主要场景） | 平台缺口；候选：config 补全器（启动前改写 opencode.jsonc，官方加载器自己消费——绕开冻结，但改用户配置文件需谨慎，待用户决策）或提上游 issue |
 | G6 | title 重生成压制 | 每轮边界多一个 title 请求 | **已实现**：续命期间 `title` hook 返回现有标题（无标题则置空）跳过重生成；Docker 实测每会话 title 请求 3→1 |
+| G7 | 消息级删除/回滚（续命删失败现场） | 每轮累积一条失败 assistant + 一条标记（界面噪音） | **平台缺口（调研结论）**：删单条消息的唯一核心机制是 revert（`RevertEvent.Committed` 投影里 `delete(SessionMessageTable) where seq >= boundary`），而插件 session 域**至今（2.0.24）仍未暴露 revert**（只新增了整会话 `remove` 与 `compact`）。替代机制逐一排除：`move` = 会话搬迁到别的目录；`fork` = 复制出新会话（HTTP 有、插件无）；`synthetic` 复用同一 id → `SyntheticConflictError`（不是 upsert）；`ctx.rpc.call` 需要宿主注册的 RPC 定义（宿主未注册可用于会话变更的定义）。可选路径：①上游 #51599（把 revert 桥接给插件，最干净）；②进程外 HTTP revert（需 serve 端口+密码，与"零进程外依赖"冲突）；③直写 opencode.db（绕过契约，WAL/状态缓存风险，不推荐）；④OpenChamber 侧把连续相同失败卡聚合（只改观感，不删记录）。 |
 
 ## 5. 业务逻辑偏差核查记录
 

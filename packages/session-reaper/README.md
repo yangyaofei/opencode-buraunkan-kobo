@@ -27,7 +27,7 @@ registry 落 `~/.local/state/opencode/session-reaper/registry.json`（XDG_STATE_
 
 ## 与 1.x 的差异
 
-- **会话删除**：2.0 插件 API 未桥接 `session.remove`（Host 域缺失），改用子进程 `opencode session delete [--server <url>] <sessionID>`（与用户手动删除同链路）。默认连后台服务；配置 `deleteServer` 指定目标（如测试容器内的 serve）。删除失败（404/`not found`）视为已删（幂等），其他失败保留会话待下次收割。
+- **会话删除**：优先用插件原生 `ctx.session.remove({ sessionID })`（opencode ≥ 2.0.24 起插件 session 域暴露 remove，进程内直调、递归删子会话，任何部署方式都可用）。旧版本（无 `remove`）自动回退到子进程 `opencode session delete [--server <url>] <sessionID>`（与用户手动删除同链路；默认连后台服务，配置 `deleteServer` 指定目标）。删除失败（404/`not found`）视为已删（幂等），其他失败保留会话待下次收割。
 - **环境注入**：1.x 通过 `shell.env` hook 注入 `OPENCODE_SESSION_ID`；2.0 的 shell hook 无 sessionID 维度，已放弃（辅助功能）。
 - **零模型回复**：1.x 用 `noReply` + ignored parts + 哨兵异常 hack；2.0 用官方 `ctx.session.synthetic`。
 

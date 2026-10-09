@@ -9,7 +9,8 @@ import {
   parseResetAtMs,
   pickHop,
   readProviderApiKeys,
-  stripTrailingEmptyUsers,
+  stripTrailingMarkerUsers,
+  shouldContinue,
   type PluginConfig,
   xdgDataDir,
   zhipuResetAtMs,
@@ -151,35 +152,96 @@ describe("端到端(body 场景)", () => {
   })
 })
 
-describe("stripTrailingEmptyUsers(出口净化)", () => {
-  test("剥掉尾部空字符串 user", () => {
+describe("stripTrailingMarkerUsers(出口净化)", () => {
+  test("剥掉尾部的前缀标记 user(字符串形态)", () => {
     const msgs = [
       { role: "user", content: "hi" },
       { role: "assistant", content: "done" },
-      { role: "user", content: "" },
+      { role: "user", content: "quota-retry-round-ab12cd34" },
     ]
-    const out = stripTrailingEmptyUsers(msgs)!
+    const out = stripTrailingMarkerUsers(msgs)!
     expect(out.length).toBe(2)
     expect((out[1] as any).role).toBe("assistant")
   })
 
-  test("剥掉多个连续空 user(含空数组形态)", () => {
+  test("剥掉多个连续标记 user(含 parts 形态)", () => {
     const msgs = [
       { role: "user", content: "hi" },
-      { role: "user", content: [] },
-      { role: "user", content: "" },
+      { role: "user", content: [{ type: "text", text: "quota-retry-round-x1" }] },
+      { role: "user", content: "quota-retry-round-x2" },
     ]
-    expect(stripTrailingEmptyUsers(msgs)!.length).toBe(1)
+    expect(stripTrailingMarkerUsers(msgs)!.length).toBe(1)
   })
 
-  test("不误伤: 尾部是非空 user / assistant 时不改动(返回 null)", () => {
-    expect(stripTrailingEmptyUsers([{ role: "user", content: "hi" }])).toBeNull()
-    expect(stripTrailingEmptyUsers([{ role: "assistant", content: "" }])).toBeNull()
-    expect(stripTrailingEmptyUsers([{ role: "user", content: [{ type: "text", text: "x" }] }])).toBeNull()
+  test("空 user 不再被剥(空可能是用户真的发了空串)", () => {
+    expect(stripTrailingMarkerUsers([{ role: "user", content: "" }])).toBeNull()
+    expect(stripTrailingMarkerUsers([{ role: "user", content: [] }])).toBeNull()
   })
 
-  test("全部是空 user 时剥到空数组", () => {
-    expect(stripTrailingEmptyUsers([{ role: "user", content: "" }])!.length).toBe(0)
+  test("不误伤: 普通消息/assistant/带前缀但不匹配的 parts 返回 null", () => {
+    expect(stripTrailingMarkerUsers([{ role: "user", content: "hi" }])).toBeNull()
+    expect(stripTrailingMarkerUsers([{ role: "assistant", content: "quota-retry-round-x" }])).toBeNull()
+    expect(stripTrailingMarkerUsers([{ role: "user", content: [{ type: "text", text: "hi" }] }])).toBeNull()
+    // parts 里混有普通文本 → 不算标记
+    expect(
+      stripTrailingMarkerUsers([
+        { role: "user", content: [{ type: "text", text: "quota-retry-round-x" }, { type: "text", text: "hi" }] },
+      ]),
+    ).toBeNull()
+  })
+
+  test("自定义前缀生效", () => {
+    expect(stripTrailingMarkerUsers([{ role: "user", content: "xyz-1" }], "xyz-")!.length).toBe(0)
+    expect(stripTrailingMarkerUsers([{ role: "user", content: "xyz-1" }], "abc-")).toBeNull()
+  })
+})
+
+describe("shouldContinue(续命触发策略)", () => {
+  test("默认可重试类型续命", () => {
+    for (const type of ["provider.quota", "provider.rate-limit", "provider.internal", "provider.transport", "provider.invalid-output", "provider.unknown"]) {
+      expect(shouldContinue({ type }, undefined)).toBe(true)
+    }
+  })
+
+  test("默认拒绝类型不续命(鉴权/内容/非法请求/不支持/无路由)", () => {
+    for (const type of ["provider.auth", "provider.content-filter", "provider.invalid-request", "provider.unsupported-operation", "provider.no-route"]) {
+      expect(shouldContinue({ type }, undefined)).toBe(false)
+    }
+  })
+
+  test("默认状态码: 429 与 5xx 续命, 4xx(除 429)不续命", () => {
+    expect(shouldContinue({ status: 429 }, undefined)).toBe(true)
+    expect(shouldContinue({ status: 503 }, undefined)).toBe(true)
+    expect(shouldContinue({ status: 599 }, undefined)).toBe(true)
+    expect(shouldContinue({ status: 400 }, undefined)).toBe(false)
+    expect(shouldContinue({ status: 404 }, undefined)).toBe(false)
+  })
+
+  test("denyTypes 优先于类型/状态码", () => {
+    expect(shouldContinue({ type: "provider.invalid-request", status: 503 }, undefined)).toBe(false)
+    expect(shouldContinue({ type: "provider.rate-limit", status: 400 }, undefined)).toBe(true)
+  })
+
+  test("自定义 types/statuses/match 覆盖默认", () => {
+    expect(shouldContinue({ type: "provider.timeout" }, { types: ["provider.timeout"] })).toBe(true)
+    expect(shouldContinue({ status: 400 }, { statuses: [400] })).toBe(true)
+    expect(shouldContinue({ status: 400, message: "rate limited by upstream" }, { match: "rate limited" })).toBe(true)
+    expect(shouldContinue({ status: 400, message: "bad input" }, { match: "rate limited" })).toBe(false)
+    // 自定义 types 后, 默认集合不再生效
+    expect(shouldContinue({ type: "provider.internal" }, { types: ["provider.quota"] })).toBe(false)
+  })
+
+  test("denyTypes 一票否决: 默认 deny 里的类型需显式移除才能续命", () => {
+    // provider.invalid-request 在默认 deny 里 → 即使 match 命中也不续命
+    expect(shouldContinue({ type: "provider.invalid-request", message: "rate limited" }, { match: "rate limited" })).toBe(false)
+    // 显式 denyTypes: [] 后, match / types 生效
+    expect(shouldContinue({ type: "provider.invalid-request", message: "rate limited" }, { match: "rate limited", denyTypes: [] })).toBe(true)
+    expect(shouldContinue({ type: "provider.content-filter" }, { types: ["provider.content-filter"], denyTypes: [] })).toBe(true)
+  })
+
+  test("空错误不续命", () => {
+    expect(shouldContinue(undefined, undefined)).toBe(false)
+    expect(shouldContinue(null, undefined)).toBe(false)
   })
 })
 

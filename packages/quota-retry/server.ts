@@ -37,11 +37,13 @@ import {
   pickHop,
   parseResetAtMs,
   readProviderApiKeys,
-  stripTrailingEmptyUsers,
+  shouldContinue,
+  stripTrailingMarkerUsers,
   xdgDataDir,
   zhipuResetAtMs,
   DEFAULT_QUOTA_CACHE_MS,
   DEFAULT_FALLBACK_WAIT_MS,
+  MARKER_TEXT_PREFIX,
   type PluginConfig,
   type ProviderConfig,
 } from "./core"
@@ -99,14 +101,17 @@ export default {
     const quotaCacheMs = cfg.quotaCacheMs ?? DEFAULT_QUOTA_CACHE_MS
     const maxRounds = cfg.maxRounds ?? Number(process.env.QUOTA_RETRY_MAX_ROUNDS ?? -1)
 
-    // 运行时 providerID → 配置: setup 时先算一次, 之后按需刷新。
+    // 运行时 providerID → 配置: 懒刷新。
+    // 2.0.16 死锁教训: setup 期间 await provider State 读取会与插件层初始化循环等待
+    // (provider State 的重放依赖插件层就绪), 内置插件列表变化放大了启动时序窗口 → 间歇挂死。
+    // 规则: 插件 setup 绝不 await 任何 State 读取; expandProviders(cfg, []) 的静态展开已够,
+    // 运行时 provider 清单在首个 hook 触发时再补。
     let expanded = expandProviders(cfg, [])
     const refreshExpanded = async () => {
       try {
         expanded = expandProviders(cfg, providerIdsOf(await ctx.provider.list()))
       } catch {}
     }
-    await refreshExpanded()
 
     // ── on-demand 虚模型降级链(1.x onDemandModels 移植) ──
     const onDemand = expandOnDemand((cfg as any).onDemandModels)
@@ -184,17 +189,24 @@ export default {
     const zhipuCache = new Map<string, { at: number; resetAt: number }>() // providerID -> 精确重置时刻缓存
     const rounds = new Map<string, number>() // sid -> 当前 turn 已续命轮数
     const stopped = new Set<string>() // 用户接管/中断后不再续命
-    const quotaHit = new Set<string>() // retry hook 判定过配额的会话(轮次触发条件)
+    const quotaHit = new Set<string>() // retry hook 判定过配额的会话(精确等待来源)
+    // sid -> 最近一次失败的错误(原生重试耗尽时判定是否续命, 见 shouldContinue)
+    const lastFailure = new Map<string, { type?: string; status?: number; message?: string }>()
     // providerID -> 出站 Authorization 头(zhipu 配额查询的 apiKey 回退来源, 对齐 1.x)
     const authCache = new Map<string, string>()
+
+    // 本 turn 是否处于"续命救援"中(配额精确等待命中, 或已开始轮次)
+    const inRescue = (sid: string) => quotaHit.has(sid) || rounds.has(sid)
 
     const resetSession = (sid: string) => {
       rounds.delete(sid)
       stopped.delete(sid)
       quotaHit.delete(sid)
+      lastFailure.delete(sid)
     }
 
-    // ── 部件 3: 出口净化 — 剥掉尾部空 user 消息(轮次标记的映射残留) ──
+    // ── 部件 3: 出口净化 — 剥掉尾部"轮次标记"映射出的 user 消息 ──
+    // 只认标记文本前缀(前缀+随机 token), 不按"空"判定: 空 user 可能是用户真的发了 ""。
     await ctx.session.hook("http.request", async (evt: any) => {
       try {
         const req: Request = evt.request
@@ -208,12 +220,12 @@ export default {
         if (req.method === "POST") {
           const body: any = await req.clone().json().catch(() => null)
           if (body && Array.isArray(body.messages) && body.messages.length > 0) {
-            const stripped = stripTrailingEmptyUsers(body.messages)
+            const stripped = stripTrailingMarkerUsers(body.messages, MARKER_TEXT_PREFIX)
             if (stripped) {
               const headers = new Headers(req.headers)
               headers.delete("content-length")
               evt.request = new Request(req, { method: "POST", headers, body: JSON.stringify({ ...body, messages: stripped }) })
-              dbg("[strip] removed trailing empty user message(s)")
+              dbg("[strip] removed trailing marker user message(s)")
             }
           }
         }
@@ -230,7 +242,7 @@ export default {
     // ── 部件 1a 前置: 续命期间压制 title 重生成(空标记驱动的新执行会触发它, 浪费一次请求) ──
     await ctx.session.hook("title", async (evt: any) => {
       const sessionID = String(evt?.sessionID ?? "")
-      if (!sessionID || !quotaHit.has(sessionID)) return
+      if (!sessionID || !inRescue(sessionID)) return
       // 一律置空跳过 title 模型请求(续命期间 title 保持原值)
       evt.result = ""
     })
@@ -307,14 +319,16 @@ export default {
     // 代价(已接受): 不删失败现场, 每轮累积一条失败 assistant + 一条标记(界面噪音);
     // 发给模型的请求由出口 strip 保持干净(空 user 剥除)。
     const redoRound = async (sessionID: string, round: number) => {
-      // 空标记: description 前台可见, text="" 是驱动执行的载体(出口剥掉)。
+      // 标记 text = 前缀 + 随机 token: 出口按前缀精确剥掉(不靠"空"判定),
+      // description 前台可见, id 自指定便于定位。
       const markerID = `msg_${MARKER_PREFIX}_r${round}_${Date.now().toString(36)}`
+      const markerText = `${MARKER_TEXT_PREFIX}${Math.random().toString(36).slice(2, 10)}`
       try {
         await ctx.session.synthetic({
           sessionID,
           id: markerID,
-          text: "",
-          description: `${MARKER_PREFIX} · 第 ${round} 轮 · 内部标记(不发给模型)`,
+          text: markerText,
+          description: `${MARKER_PREFIX} · 第 ${round} 轮`,
         })
       } catch (err: any) {
         dbg("[round] synthetic FAIL:", String(err?.message ?? err).slice(0, 140))
@@ -330,15 +344,23 @@ export default {
             const type = (ev as any).type
             const data = (ev as any).data ?? ev
             if (type === "session.inbox.enqueued" && data?.item?.type === "user") {
-              // 用户接管: 仅在本 turn 已处于配额救援中才算接管(初始 prompt 的入队不算,
+              // 用户接管: 仅在本 turn 已处于续命救援中才算接管(初始 prompt 的入队不算,
               // 否则每个 turn 的第一次入队就会把续命全关掉)。
-              if (quotaHit.has(String(data.sessionID ?? ""))) {
+              if (inRescue(String(data.sessionID ?? ""))) {
                 stopped.add(String(data.sessionID))
                 console.log(`[quota-retry] ${data.sessionID} 用户接管, 停止续命`)
               }
               continue
             }
             if (type === "session.step.failed") {
+              const err = data?.error
+              if (err && data?.sessionID) {
+                lastFailure.set(String(data.sessionID), {
+                  type: String(err.type ?? ""),
+                  status: typeof err.status === "number" ? err.status : undefined,
+                  message: String(err.message ?? ""),
+                })
+              }
               dbg("[ev] step.failed:", JSON.stringify(data).slice(0, 300))
               continue
             }
@@ -355,7 +377,11 @@ export default {
             }
             if (type !== "session.execution.failed") continue
             const sid = String(data.sessionID ?? "")
-            if (!sid || stopped.has(sid) || !quotaHit.has(sid)) continue
+            if (!sid || stopped.has(sid)) continue
+            // 续命触发: 配额救援中, 或失败错误命中续命策略(可重试类型 / 429+5xx / 自定义 match)。
+            const failure = data.error ?? lastFailure.get(sid)
+            if (!inRescue(sid) && !shouldContinue(failure, cfg?.continueOn)) continue
+            dbg("[ev] continue:", JSON.stringify(failure ?? null).slice(0, 200))
             const n = (rounds.get(sid) ?? 0) + 1
             if (maxRounds >= 0 && n > maxRounds) {
               console.log(`[quota-retry] ${sid} 达到轮数上限 ${maxRounds}, 停止续命`)
@@ -384,6 +410,7 @@ export default {
       if (sessionID && rounds.has(sessionID))
         lines.push("", `  当前 turn 已续命 ${rounds.get(sessionID)} 轮(每轮 = 原生 10 次重试)`)
       lines.push("", "语义: 无限轮次续命, 每轮 10 次原生重试, 每次等待不封顶(可等到配额重置)。")
+      lines.push("续命触发: 默认 = 可重试错误类型 + 429/5xx; 可用 continueOn.types/statuses/match 覆盖, denyTypes 排除。")
       return lines.join("\n")
     }
 

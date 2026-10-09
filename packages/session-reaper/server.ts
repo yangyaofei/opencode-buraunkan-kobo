@@ -28,14 +28,36 @@ type Ctx = {
       skills?: unknown
       delivery?: string
     }) => Promise<unknown>
+    // opencode >= 2.0.24 起插件 session 域暴露了 remove(整会话删除, 递归删子会话)。
+    remove?: (input: { sessionID: string }) => Promise<unknown>
   }
   command: { transform: (cb: (editor: { add: (def: any) => void }) => void) => Promise<unknown> }
 }
 
-// 会话删除: 2.0 插件 API 未暴露 session.remove, 用子进程 CLI 兜底。
-// `opencode session delete <id>` 连接后台服务(与用户手动删除同一链路);
-// 配置了 deleteServer 时改连指定服务端(需 env OPENCODE_PASSWORD 提供密码)。
+// 会话删除优先用插件原生 API ctx.session.remove(opencode >= 2.0.24): 进程内直调,
+// 任何部署方式都可用。旧版本(无 remove)回退到子进程 CLI —— `opencode session delete`
+// 连后台服务(与用户手动删除同一链路), 配置 deleteServer 时改连指定服务端。
 // "not found" 视为已清理(幂等); 其余失败返回 false 保留在桶中下次重试。
+async function deleteSession(
+  ctx: Ctx,
+  sessionID: string,
+  deleteServer?: string,
+): Promise<boolean> {
+  const remove = ctx.session?.remove
+  if (typeof remove === "function") {
+    try {
+      await remove({ sessionID })
+      return true
+    } catch (err: any) {
+      const msg = String(err?.message ?? err)
+      if (/not found|notfound|404/i.test(msg)) return true
+      console.error(`[session-reaper] ctx.session.remove ${sessionID} failed: ${msg.slice(0, 200)}`)
+      return false
+    }
+  }
+  return await deleteSessionViaCli(sessionID, 20_000, deleteServer)
+}
+
 async function deleteSessionViaCli(
   sessionID: string,
   timeoutMs = 20_000,
@@ -74,6 +96,7 @@ async function deleteSessionViaCli(
 }
 
 async function reapPipeline(
+  ctx: Ctx,
   cfg: ReturnType<typeof loadConfig>,
   reg: Record<string, Entry[]>,
   pipeline: string,
@@ -83,7 +106,7 @@ async function reapPipeline(
   const reaped: Entry[] = []
   const failed: Entry[] = []
   for (const e of [...expired, ...overflow]) {
-    if (await deleteSessionViaCli(e.id, 20_000, cfg.deleteServer)) reaped.push(e)
+    if (await deleteSession(ctx, e.id, cfg.deleteServer)) reaped.push(e)
     else failed.push(e)
   }
   return { expired, overflow, reaped, failed, survivors }
@@ -129,7 +152,7 @@ export default {
               return
             }
             const reg = loadRegistry(registryFile)
-            const { expired, overflow, reaped, failed, survivors } = await reapPipeline(cfg, reg, parsed.pipeline)
+            const { expired, overflow, reaped, failed, survivors } = await reapPipeline(ctx, cfg, reg, parsed.pipeline)
             for (const e of reaped) console.log(`[session-reaper] reaped ${parsed.pipeline} ${e.id}`)
             const now = Date.now()
             const kept = [...survivors, ...failed]
@@ -237,7 +260,7 @@ export default {
               return
             }
             const reg = loadRegistry(registryFile)
-            const { expired, overflow, reaped, failed, survivors } = await reapPipeline(cfg, reg, parsed.pipeline)
+            const { expired, overflow, reaped, failed, survivors } = await reapPipeline(ctx, cfg, reg, parsed.pipeline)
             reg[parsed.pipeline] = [...survivors, ...failed]
             saveRegistry(registryFile, reg)
             appendLog(cfg, registryFile, {
