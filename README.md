@@ -18,9 +18,9 @@
 // ~/.config/opencode/opencode.jsonc
 {
   "plugins": [
-    "git+https://github.com/yangyaofei/opencode-buraunkan-kobo.git#v2::path:packages/quota-retry",
-    "git+https://github.com/yangyaofei/opencode-buraunkan-kobo.git#v2::path:packages/session-reaper",
-    "git+https://github.com/yangyaofei/opencode-buraunkan-kobo.git#v2::path:packages/catalog-bridge"
+    "git+https://github.com/yangyaofei/opencode-buraunkan-kobo.git#master::path:packages/quota-retry",
+    "git+https://github.com/yangyaofei/opencode-buraunkan-kobo.git#master::path:packages/session-reaper",
+    "git+https://github.com/yangyaofei/opencode-buraunkan-kobo.git#master::path:packages/catalog-bridge"
   ]
 }
 ```
@@ -33,8 +33,8 @@ A local path works the same way (`"/path/to/repo/packages/quota-retry"`), which 
 
 ### Updating and pinning
 
-- The snippet above uses a **branch** (`#v2`). opencode **detects** new commits on it — `opencode plugin check` (also in the TUI plugin panel; the result is cached for 24 hours) marks the plugin `outdated` — but it does **not replace it by itself**: a normal start reuses the already-installed copy (`install=false`). To actually pull the new revision, run **`opencode plugin update`** (or the update action in the TUI plugin panel; the `plugin.update` API behind it).
-- To **pin** a version, replace `#v2` with a full commit sha (`#<40-char sha>`). A sha spec is immutable to opencode (`Npm.check` returns false), so it is never reported as outdated.
+- The snippet above uses a **branch** (`#master`). opencode **detects** new commits on it — `opencode plugin check` (also in the TUI plugin panel; the result is cached for 24 hours) marks the plugin `outdated` — but it does **not replace it by itself**: a normal start reuses the already-installed copy (`install=false`). To actually pull the new revision, run **`opencode plugin update`** (or the update action in the TUI plugin panel; the `plugin.update` API behind it).
+- To **pin** a version, replace `#master` with a full commit sha (`#<40-char sha>`). A sha spec is immutable to opencode (`Npm.check` returns false), so it is never reported as outdated.
 - A local-path install (`"/path/to/repo/packages/quota-retry"`) is read **in place**: edit the files and restart; no update action needed.
 
 
@@ -45,7 +45,6 @@ packages/
   quota-retry/       opencode 2.0 plugin (server.ts, core.ts, config.ts, tests, README)
   session-reaper/    opencode 2.0 plugin (server.ts, reaper.ts, tests, README)
   catalog-bridge/    opencode 2.0 plugin (server.ts, catalog.ts, tests, README)
-  openchamber-mcp/   OpenChamber extension: MCP server for session orchestration
 docs/
   v1-v2-parity.md    1.x → 2.0 feature-by-feature comparison and known gaps
 ```
