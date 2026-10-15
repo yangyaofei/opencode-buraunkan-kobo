@@ -40,7 +40,7 @@
 
 ### 1.3 轮次续命的代价（相对 V1 补丁方案，如实列出）
 
-1. **失败现场不删除（唯一实质代价）**：revert 没有 2.0 插件 API（session 域无 remove/revert），续命不删上轮失败记录 → 每轮累积一条失败 assistant + 一条标记（10 轮 ≈ 多 20 条记录，界面噪音）。已提上游 issue #51599。V1 无此问题（同一执行内连续重试，无轮次概念）。不影响模型上下文：标记在出口被剥除、失败 assistant 无内容不入请求（Docker 实测 45×429 全程同 hash）。
+1. **失败现场不删除（唯一实质代价）**：revert 没有 2.0 插件 API（session 域无 remove/revert），续命不删上轮失败记录 → 每轮累积一条失败 assistant + 一条标记（10 轮 ≈ 多 20 条记录，界面噪音）。已提上游 issue #51599（本仓库跟踪：issue #3）。V1 无此问题（同一执行内连续重试，无轮次概念）。不影响模型上下文：标记在出口被剥除、失败 assistant 无内容不入请求（Docker 实测 45×429 全程同 hash）。
 2. **轮次边界约 0.3-0.5s 空档**：失败落地 → 标记注入 → 新执行启动。机制固有（执行真结束+新执行真启动），V1 无空档（同一执行内连续重试）。
 3. **每轮边界多一个 title 重生成请求**（synthetic 驱动新执行触发，约 1 次 msgs=2 小请求）。已用 title hook 压制（续命期间跳过 title 重生成，G6）。
 4. **attempt 每轮从 1 重计**（V1 补丁后连续计数）。用户已确认此语义可接受（"我要看到第二轮的 attempt 2"）。
@@ -102,7 +102,7 @@
 | G4 | 插件自更新（shared/sync） | 1.x 需要自建节流检查+重装触发 | **无需移植**：2.0 有原生 PluginUpdate 服务（`check`/`update`，24h 节流，npm 后端，`packages/core/src/plugin/update.ts`） |
 | G5 | catalog-bridge 对 config 型 provider | 自定义 provider 元数据补全不可用（V1 主要场景） | 平台缺口；候选：config 补全器（启动前改写 opencode.jsonc，官方加载器自己消费——绕开冻结，但改用户配置文件需谨慎，待用户决策）或提上游 issue |
 | G6 | title 重生成压制 | 每轮边界多一个 title 请求 | **已实现**：续命期间 `title` hook 返回现有标题（无标题则置空）跳过重生成；Docker 实测每会话 title 请求 3→1 |
-| G7 | 消息级删除/回滚（续命删失败现场） | 每轮累积一条失败 assistant + 一条标记（界面噪音） | **平台缺口（调研结论）**：删单条消息的唯一核心机制是 revert（`RevertEvent.Committed` 投影里 `delete(SessionMessageTable) where seq >= boundary`），而插件 session 域**至今（2.0.24）仍未暴露 revert**（只新增了整会话 `remove` 与 `compact`）。替代机制逐一排除：`move` = 会话搬迁到别的目录；`fork` = 复制出新会话（HTTP 有、插件无）；`synthetic` 复用同一 id → `SyntheticConflictError`（不是 upsert）；`ctx.rpc.call` 需要宿主注册的 RPC 定义（宿主未注册可用于会话变更的定义）。可选路径：①上游 #51599（把 revert 桥接给插件，最干净）；②进程外 HTTP revert（需 serve 端口+密码，与"零进程外依赖"冲突）；③直写 opencode.db（绕过契约，WAL/状态缓存风险，不推荐）；④OpenChamber 侧把连续相同失败卡聚合（只改观感，不删记录）。 |
+| G7 | 消息级删除/回滚（续命删失败现场） | 每轮累积一条失败 assistant + 一条标记（界面噪音） | （本仓库 issue #3） **平台缺口（调研结论）**：删单条消息的唯一核心机制是 revert（`RevertEvent.Committed` 投影里 `delete(SessionMessageTable) where seq >= boundary`），而插件 session 域**至今（2.0.24）仍未暴露 revert**（只新增了整会话 `remove` 与 `compact`）。替代机制逐一排除：`move` = 会话搬迁到别的目录；`fork` = 复制出新会话（HTTP 有、插件无）；`synthetic` 复用同一 id → `SyntheticConflictError`（不是 upsert）；`ctx.rpc.call` 需要宿主注册的 RPC 定义（宿主未注册可用于会话变更的定义）。可选路径：①上游 #51599（把 revert 桥接给插件，最干净）；②进程外 HTTP revert（需 serve 端口+密码，与"零进程外依赖"冲突）；③直写 opencode.db（绕过契约，WAL/状态缓存风险，不推荐）；④OpenChamber 侧把连续相同失败卡聚合（只改观感，不删记录）。 |
 
 ## 5. 业务逻辑偏差核查记录
 
