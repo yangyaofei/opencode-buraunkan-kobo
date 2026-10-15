@@ -8,6 +8,7 @@ Kenkyujo）的一楼——让未来道具 8 号机「电话微波炉（暂定）
 
 ## 插件（未来道具）
 
+<<<<<<< Updated upstream
 1. **quota-retry** —— 拦截配额耗尽的 429，注入精确的 `retry-after-ms`，让
    opencode 在限额重置后再重试，而不是原生退避约 70 秒后放弃；可选二进制补丁
    把硬编码的重试上限变为可配置。另支持 **on-demand 虚模型**：配额耗尽时不死等，
@@ -17,6 +18,13 @@ Kenkyujo）的一楼——让未来道具 8 号机「电话微波炉（暂定）
    subagent 子会话）。
 3. **catalog-bridge** —— 自定义 provider 的模型自动从 models.dev 复用元数据
    （limit / cost / reasoning / variants 等）；逐字段补缺失，不覆盖已手写的值。
+=======
+| 包 | 作用 |
+|---|---|
+| [`packages/quota-retry`](packages/quota-retry) | 配额感知重试。识别配额类 429，精确等待到配额重置（等待不封顶），并在 opencode 原生 10 次上限耗尽后**无限轮次**继续重试。 |
+| [`packages/session-reaper`](packages/session-reaper) | 会话登记 + 按流水线收割（`keepDays` / `maxSessions`），用 synthetic 消息回执，走原生会话 API 删除。 |
+| [`packages/catalog-bridge`](packages/catalog-bridge) | 为自定义 provider 的模型补全元数据（上下文/输出上限、价格、能力、变体），数据来自 [models.dev](https://models.dev)。 |
+>>>>>>> Stashed changes
 
 ## 安装
 

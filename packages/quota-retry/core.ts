@@ -217,61 +217,6 @@ export function stripTrailingMarkerUsers(
   return changed ? out : null
 }
 
-// ── on-demand 虚模型降级链(1.x onDemandModels 的 2.0 移植) ──
-
-export type OnDemandChainEntry = {
-  provider?: string // 跳的标识(仅用于配额匹配与展示)
-  model: string // 该跳的真实 model id(写入请求体)
-  baseURL: string // 该跳的 API 端点(http.request 改写目标)
-  apiKey?: string // 该跳的鉴权(替换 Authorization)
-  quotaMatch?: string // 该跳的配额特征(缺省用全局)
-}
-
-export type OnDemandModel = {
-  model: string // 虚模型 ID(TUI 模型列表里出现)
-  provider: string // 挂载的 opencode providerID
-  name?: string
-  npm?: string // 自动创建挂载组时用的 SDK 包, 默认 @ai-sdk/openai-compatible
-  providerName?: string // 自动创建挂载组时的分组显示名
-  // 挂载组自身的连接信息(=链首跳的 baseURL/apiKey)。
-  // 2.0 外部插件的重放视图里 config 型 provider 排在后面, 运行时拿不到它们的 settings,
-  // 因此挂载组连接必须显式声明(1.x 是从 config provider 自动继承的)。
-  baseURL?: string // 挂载组自身连接(缺省取链首跳)
-  apiKey?: string
-  chain: OnDemandChainEntry[]
-}
-
-// 校验并展开 onDemandModels: chain 非空、model/provider 必填; 非法条目整条跳过。
-export function expandOnDemand(list: OnDemandModel[] | undefined): OnDemandModel[] {
-  const out: OnDemandModel[] = []
-  for (const m of list ?? []) {
-    if (!m || typeof m.model !== "string" || !m.model) continue
-    if (!m.provider) continue
-    const chain = (m.chain ?? []).filter((h) => h && typeof h.model === "string" && h.model !== "")
-    if (chain.length === 0) continue
-    const okChain = chain.every((h) => typeof h.baseURL === "string" && h.baseURL !== "")
-    if (!okChain && typeof m.baseURL !== "string") continue
-    out.push({ ...m, chain })
-  }
-  return out
-}
-
-// on-demand HTTP 链状态机: deadUntil 记录各跳配额死亡时刻, 选第一个活跳(全死时用最后一跳等原生重试轮次续命重扫)。
-export type ChainState = { deadUntil: Map<number, number> }
-
-export function pickHop(chain: OnDemandChainEntry[], state: ChainState, now = Date.now()): number {
-  for (let i = 0; i < chain.length; i++) {
-    const until = state.deadUntil.get(i) ?? 0
-    if (now >= until) return i
-  }
-  return chain.length - 1
-}
-
-export function markDead(chain: OnDemandChainEntry[], state: ChainState, hop: number, resetAtMs: number) {
-  if (hop < 0 || hop >= chain.length) return
-  state.deadUntil.set(hop, Math.max(state.deadUntil.get(hop) ?? 0, resetAtMs))
-}
-
 // ── provider 凭据读取(opencode.db credential 表, 参考 OpenChamber credential-db.js) ──
 // 2.x 没有 HTTP 路由交回 apiKey; 凭据存 <dataDir>/opencode.db 的 credential 表(明文 JSON)。
 // 表结构以 v2.0.15 packages/core/src/credential/sql.ts 核实: integration_id/value/active/time_updated。

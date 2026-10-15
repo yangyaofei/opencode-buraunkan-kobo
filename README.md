@@ -8,6 +8,7 @@ Laboratory (Mirai Gadget Kenkyujo) — the Lifter that makes Mirai Gadget
 
 ## Plugins (Future Gadgets)
 
+<<<<<<< Updated upstream
 1. **quota-retry** — intercepts quota-exhausted 429s and injects an exact
    `retry-after-ms`, so opencode retries after the quota resets instead of
    giving up after ~70s of native backoff. Optional binary patch makes the
@@ -21,6 +22,13 @@ Laboratory (Mirai Gadget Kenkyujo) — the Lifter that makes Mirai Gadget
 3. **catalog-bridge** — auto-fills model metadata (limit / cost / reasoning /
    variants) for custom providers from the models.dev catalog; only missing
    fields are filled, user-written values are never overwritten.
+=======
+| Package | What it does |
+|---|---|
+| [`packages/quota-retry`](packages/quota-retry) | Quota-aware retry. Recognises quota 429s, waits exactly until the quota resets (no cap), and keeps retrying past opencode's native 10-attempt cap in unlimited rounds. |
+| [`packages/session-reaper`](packages/session-reaper) | Session registry + pipeline reaping (`keepDays` / `maxSessions`), reports back through a synthetic message, deletes through the native session API. |
+| [`packages/catalog-bridge`](packages/catalog-bridge) | Fills in model metadata (limits, cost, capabilities, variants) for custom providers from [models.dev](https://models.dev). |
+>>>>>>> Stashed changes
 
 ## Installation
 
