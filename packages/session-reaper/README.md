@@ -7,7 +7,9 @@
 ```jsonc
 // ~/.config/opencode/opencode.jsonc
 {
-  "plugins": ["/<本仓库路径>/packages/session-reaper"]
+  "plugins": [
+    // 从 git 装(机器上用这个): "git+https://github.com/yangyaofei/opencode-buraunkan-kobo.git#master::path:packages/session-reaper",
+    "/<本仓库路径>/packages/session-reaper"]
 }
 ```
 
