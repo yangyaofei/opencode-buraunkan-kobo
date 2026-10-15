@@ -32,6 +32,7 @@
 |---|---|
 | 二进制补丁 `maxRetries=-1`（无限次数） | 轮次续命（见下） |
 | hook 改 delay + 补丁改次数 | hook 改 delay + 轮次续命（每轮原生 10 次, 无限轮） |
+<<<<<<< Updated upstream
 | on-demand 降级链：挂载组自动创建 | on-demand 降级链：挂载组需在 opencode.jsonc 声明一行 stub（见下） |
 
 ## on-demand 降级链（虚模型跨 provider fallback）
@@ -80,6 +81,8 @@
 **已知代价（纯插件 API 的取舍）**：revert 没有插件 API（2.0.15 插件 session 域无 remove/revert，已提上游 issue），续命不删失败现场——每轮累积一条失败 assistant 和一条轮次标记（10 轮 ≈ 消息列表多 20 条记录，界面噪音）；不影响功能，工具/思考历史完整保留。发给模型的请求不受影响（标记被剥除，失败 assistant 无内容不入请求）。
 
 **零进程外依赖**：全部走插件 API（`ctx.session`/`ctx.event`），无端口/密码/HTTP 约束，任何部署方式（serve / service / TUI / 托管）行为一致。
+=======
+>>>>>>> Stashed changes
 
 ## 配置
 

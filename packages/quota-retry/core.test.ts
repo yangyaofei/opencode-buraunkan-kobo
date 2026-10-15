@@ -1,13 +1,10 @@
 import { describe, expect, test } from "bun:test"
 import {
   computeWaitMs,
-  expandOnDemand,
   expandProviders,
   isQuotaError,
   isQuotaText,
-  markDead,
   parseResetAtMs,
-  pickHop,
   readProviderApiKeys,
   stripTrailingMarkerUsers,
   shouldContinue,
@@ -242,43 +239,6 @@ describe("shouldContinue(续命触发策略)", () => {
   test("空错误不续命", () => {
     expect(shouldContinue(undefined, undefined)).toBe(false)
     expect(shouldContinue(null, undefined)).toBe(false)
-  })
-})
-
-describe("on-demand 降级链", () => {
-  test("expandOnDemand: 非法条目跳过(空链/缺 model/缺 provider)", () => {
-    const out = expandOnDemand([
-      { model: "ok", provider: "g", baseURL: "http://h/v1", chain: [{ model: "m1", baseURL: "http://h/v1" }, { model: "" }, undefined as any] },
-      { model: "", provider: "g", chain: [{ model: "m", baseURL: "http://h/v1" }] },
-      { model: "x", chain: [{ model: "m", baseURL: "http://h/v1" }] },
-      { model: "y", provider: "g", chain: [] },
-    ])
-    expect(out.length).toBe(1)
-    expect(out[0].chain.length).toBe(1)
-  })
-})
-
-describe("on-demand HTTP 链状态机", () => {
-  const chain = [
-    { provider: "a", model: "m", baseURL: "http://a/v1" },
-    { provider: "b", model: "m", baseURL: "http://b/v1" },
-  ]
-  test("全活选第 0 跳; 首跳死亡选第 1 跳; 全死选最后一跳", () => {
-    const st = { deadUntil: new Map<number, number>() }
-    expect(pickHop(chain, st)).toBe(0)
-    markDead(chain, st, 0, Date.now() + 60_000)
-    expect(pickHop(chain, st)).toBe(1)
-    markDead(chain, st, 1, Date.now() + 60_000)
-    expect(pickHop(chain, st)).toBe(1)
-  })
-  test("死亡到期后重扫回第 0 跳", () => {
-    const st = { deadUntil: new Map([[0, Date.now() - 1]]) }
-    expect(pickHop(chain, st)).toBe(0)
-  })
-  test("markDead 越界忽略", () => {
-    const st = { deadUntil: new Map<number, number>() }
-    markDead(chain, st, 5, Date.now())
-    expect(st.deadUntil.size).toBe(0)
   })
 })
 

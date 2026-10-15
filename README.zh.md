@@ -8,7 +8,7 @@
 
 | 包 | 作用 |
 |---|---|
-| [`packages/quota-retry`](packages/quota-retry) | 配额感知重试。识别配额类 429，精确等待到配额重置（等待不封顶），并在 opencode 原生 10 次上限耗尽后**无限轮次**继续重试。可选 on-demand 虚模型，跨 provider 自动降级。 |
+| [`packages/quota-retry`](packages/quota-retry) | 配额感知重试。识别配额类 429，精确等待到配额重置（等待不封顶），并在 opencode 原生 10 次上限耗尽后**无限轮次**继续重试。 |
 | [`packages/session-reaper`](packages/session-reaper) | 会话登记 + 按流水线收割（`keepDays` / `maxSessions`），用 synthetic 消息回执，走原生会话 API 删除。 |
 | [`packages/catalog-bridge`](packages/catalog-bridge) | 为自定义 provider 的模型补全元数据（上下文/输出上限、价格、能力、变体），数据来自 [models.dev](https://models.dev)。 |
 

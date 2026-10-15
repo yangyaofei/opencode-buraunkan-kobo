@@ -8,7 +8,7 @@
 
 | Package | What it does |
 |---|---|
-| [`packages/quota-retry`](packages/quota-retry) | Quota-aware retry. Recognises quota 429s, waits exactly until the quota resets (no cap), and keeps retrying past opencode's native 10-attempt cap in unlimited rounds. Optional on-demand virtual model that degrades across providers. |
+| [`packages/quota-retry`](packages/quota-retry) | Quota-aware retry. Recognises quota 429s, waits exactly until the quota resets (no cap), and keeps retrying past opencode's native 10-attempt cap in unlimited rounds. |
 | [`packages/session-reaper`](packages/session-reaper) | Session registry + pipeline reaping (`keepDays` / `maxSessions`), reports back through a synthetic message, deletes through the native session API. |
 | [`packages/catalog-bridge`](packages/catalog-bridge) | Fills in model metadata (limits, cost, capabilities, variants) for custom providers from [models.dev](https://models.dev). |
 
