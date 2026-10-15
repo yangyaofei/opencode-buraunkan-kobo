@@ -102,6 +102,7 @@
   ],
   "quotaCacheMs": 60000,
   "maxRounds": -1,
+  "heartbeatMs": 2700000,     // 长等待心跳间隔(默认 45 分钟; 0 = 关闭)
   // 续命触发策略(可选; 缺省 = 可重试类型 + 429/5xx)
   "continueOn": {
     "types": ["provider.quota", "provider.rate-limit", "provider.internal", "provider.transport"],
@@ -114,6 +115,7 @@
 
 - `continueOn.types` / `statuses` / `match` 任一命中即续命；`denyTypes` 优先（默认含 auth/content-filter/invalid-request/unsupported-operation/no-route）。要在默认 deny 的类型上续命，需显式把它从 `denyTypes` 移除（如 `"denyTypes": []`）。
 - `continueOn.statuses` 缺省 = 429 与全部 5xx。
+- `heartbeatMs`（默认 2700000 = 45 分钟）：**长等待心跳**。opencode 的 location 不活动回收在 60 分钟内没有 durable 会话事件时会以 `reason: "inactivity"` 打断正在等待的执行（`packages/core/src/location-activity.ts`：TTL 写死 60 分钟、只被"带 location 的 durable 会话事件"刷新、无配置口），而"等待配额重置"期间不产生任何事件，所以超过 60 分钟的等待会被掐断（实测：等待开始后 61 分钟 `location services evicted` + `outcome=interrupted`）。心跳 = 等待期间每 45 分钟落一条 durable 标记（`session.synthetic`，`resume: false` → 只入队不唤醒，**不打断睡眠**），让 TTL 持续被刷新；标记文本用同一前缀，出口会被剥掉，**不进入模型请求**。等待本身仍是一次到重置点（不切段）。代价：每次心跳在会话里多一条标记行。设 `0` 关闭。
 
 ## 安装
 

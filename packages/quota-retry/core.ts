@@ -39,12 +39,20 @@ export type PluginConfig = {
   maxRounds?: number
   // 续命触发策略(默认: 可重试错误类型 + 429/5xx)。
   continueOn?: ContinuePolicy
+  // 长等待心跳间隔(ms)。opencode 的 location 不活动回收在 60 分钟无 durable 会话事件时以
+  // reason="inactivity" 打断正在等待的执行(core/src/location-activity.ts, TTL 写死、只被
+  // "带 location 的 durable 会话事件"刷新)。等待配额重置期间不产生事件, 所以超过 60 分钟的
+  // 等待会被掐断。心跳 = 等待期间定期落一条 durable 标记(session.synthetic, resume:false,
+  // 不唤醒执行), 让 TTL 持续被刷新。默认 45 分钟(留余量); 0 = 关闭心跳。
+  heartbeatMs?: number
 }
 
 export const DEFAULT_QUOTA_URL = "https://open.bigmodel.cn/api/monitor/usage/quota/limit"
 export const DEFAULT_FALLBACK_WAIT_MS = 30_000
 export const DEFAULT_BUFFER_MS = 10_000
 export const DEFAULT_QUOTA_CACHE_MS = 60_000
+// 长等待心跳默认间隔: 45 分钟(低于 opencode location 回收的 60 分钟 TTL, 留 15 分钟余量)
+export const DEFAULT_HEARTBEAT_MS = 45 * 60 * 1000
 // 判定 429 是不是配额耗尽的默认正则(智谱+火山特征)
 export const DEFAULT_QUOTA_MATCH = 'AccountQuotaExceeded|usage quota|使用上限|限额将在|"code"\\s*:\\s*"1308"'
 // 从 body 提取重置时间的默认正则(捕获组 1 = 完整时间串)
@@ -109,6 +117,15 @@ export function computeWaitMs(opts: {
       ? opts.resetAtMs - opts.now + buffer
       : fallback
   return Math.max(min, Math.ceil(base))
+}
+
+// 该等待是否需要心跳: 只有"等待长于心跳间隔"才需要(短等待本来就在 TTL 内)。
+// heartbeatMs <= 0 / 非有限值 = 关闭心跳。
+export function needsHeartbeat(delayMs: number, heartbeatMs?: number): boolean {
+  const hb = heartbeatMs ?? DEFAULT_HEARTBEAT_MS
+  if (!Number.isFinite(hb) || hb <= 0) return false
+  if (!Number.isFinite(delayMs) || delayMs <= 0) return false
+  return delayMs > hb
 }
 
 

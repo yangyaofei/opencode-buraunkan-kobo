@@ -4,6 +4,7 @@ import {
   expandProviders,
   isQuotaError,
   isQuotaText,
+  needsHeartbeat,
   parseResetAtMs,
   readProviderApiKeys,
   stripTrailingMarkerUsers,
@@ -11,6 +12,7 @@ import {
   type PluginConfig,
   xdgDataDir,
   zhipuResetAtMs,
+  DEFAULT_HEARTBEAT_MS,
 } from "./core"
 
 describe("expandProviders", () => {
@@ -242,6 +244,29 @@ describe("shouldContinue(续命触发策略)", () => {
   })
 })
 
+
+describe("needsHeartbeat", () => {
+  test("等待长于心跳间隔 → 需要心跳", () => {
+    expect(needsHeartbeat(3 * 3600_000, 2_700_000)).toBe(true)
+  })
+  test("等待短于心跳间隔 → 不需要(本来就在 TTL 内)", () => {
+    expect(needsHeartbeat(10 * 60_000, 2_700_000)).toBe(false)
+    expect(needsHeartbeat(2_700_000, 2_700_000)).toBe(false)
+  })
+  test("缺省间隔 = 45 分钟", () => {
+    expect(DEFAULT_HEARTBEAT_MS).toBe(45 * 60 * 1000)
+    expect(needsHeartbeat(3 * 3600_000)).toBe(true)
+  })
+  test("0 / 负数 / 非有限值 = 关闭心跳", () => {
+    expect(needsHeartbeat(3 * 3600_000, 0)).toBe(false)
+    expect(needsHeartbeat(3 * 3600_000, -1)).toBe(false)
+    expect(needsHeartbeat(3 * 3600_000, Number.NaN)).toBe(false)
+  })
+  test("非法等待时长 → 不需要心跳", () => {
+    expect(needsHeartbeat(Number.NaN, 2_700_000)).toBe(false)
+    expect(needsHeartbeat(0, 2_700_000)).toBe(false)
+  })
+})
 
 describe("provider 凭据读取", () => {
   test("readProviderApiKeys: 无 bun:sqlite 或库缺失时返回 null 而非抛错", () => {

@@ -24,6 +24,7 @@
 //      chunk 是 JSC bytecode, 明文补丁无效 — 已实验证明)
 //   ✅ TUI 可见性(原生徽标 + 每轮覆写的通知行 "quota-retry · 第 N 轮")
 //   ✅ quota_retry_status 工具 / retry-setting 命令(零模型回复)
+//   ✅ 长等待心跳(等待期间定期落 durable 标记, 刷新 opencode location 的 60 分钟不活动 TTL)
 //   ❌ on-demand 降级链: 已移除(2.0 无模型路由能力; 见 issue #2)
 
 import { appendFileSync, mkdirSync } from "node:fs"
@@ -32,12 +33,14 @@ import {
   expandProviders,
   isQuotaError,
   isQuotaText,
+  needsHeartbeat,
   parseResetAtMs,
   shouldContinue,
   stripTrailingMarkerUsers,
   zhipuResetAtMs,
   DEFAULT_QUOTA_CACHE_MS,
   DEFAULT_FALLBACK_WAIT_MS,
+  DEFAULT_HEARTBEAT_MS,
   MARKER_TEXT_PREFIX,
   type PluginConfig,
   type ProviderConfig,
@@ -119,6 +122,42 @@ export default {
     // providerID -> 出站 Authorization 头(zhipu 配额查询的 apiKey 回退来源, 对齐 1.x)
     const authCache = new Map<string, string>()
 
+    // ── 部件 1c: 长等待心跳 ──
+    // 等待期间不产生 durable 会话事件, 而 opencode 的 location 不活动回收(60 分钟 TTL, 只被
+    // "带 location 的 durable 会话事件"刷新, core/src/location-activity.ts)会把长等待打断。
+    // 心跳 = 等待期间定期落一条 durable 标记(session.synthetic, resume:false → 只入队不唤醒,
+    // 不打断睡眠); 标记文本用同一前缀, 出口会被 strip 剥掉, 不进入模型请求。
+    const heartbeatMs = Number(cfg.heartbeatMs ?? DEFAULT_HEARTBEAT_MS)
+    const heartbeats = new Map<string, number>() // sid -> 下一次心跳时刻
+    const armHeartbeat = (sid: string, delayMs: number) => {
+      if (!sid || !needsHeartbeat(delayMs, heartbeatMs)) return
+      heartbeats.set(sid, Date.now() + heartbeatMs)
+    }
+    const disarmHeartbeat = (sid: string) => {
+      heartbeats.delete(sid)
+    }
+    const heartbeatTimer = setInterval(() => {
+      void (async () => {
+        const now = Date.now()
+        for (const [sid, due] of [...heartbeats]) {
+          if (now < due) continue
+          heartbeats.set(sid, now + heartbeatMs)
+          try {
+            await ctx.session.synthetic(sid, {
+              id: `msg_${MARKER_TEXT_PREFIX}_hb_${now.toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
+              text: `${MARKER_TEXT_PREFIX}-hb-${Math.random().toString(36).slice(2, 10)}`,
+              description: `${MARKER_TEXT_PREFIX} · 等待心跳 · 内部标记(不发给模型)`,
+              resume: false,
+            })
+            dbg("[heartbeat] synthetic:", sid)
+          } catch (err: any) {
+            dbg("[heartbeat] FAIL:", String(err?.message ?? err).slice(0, 160))
+            heartbeats.delete(sid)
+          }
+        }
+      })()
+    }, 60_000)
+
     // 本 turn 是否处于"续命救援"中(配额精确等待命中, 或已开始轮次)
     const inRescue = (sid: string) => quotaHit.has(sid) || rounds.has(sid)
 
@@ -127,6 +166,7 @@ export default {
       stopped.delete(sid)
       quotaHit.delete(sid)
       lastFailure.delete(sid)
+      disarmHeartbeat(sid)
     }
 
     // ── 部件 3: 出口净化 — 剥掉尾部"轮次标记"映射出的 user 消息 ──
@@ -209,6 +249,7 @@ export default {
       }
       const delay = computeWaitMs({ now, resetAtMs, bufferMs: p?.bufferMs, fallbackWaitMs: p?.fallbackWaitMs })
       evt.decision = { retry: true, delay }
+      armHeartbeat(sessionID, delay)
       console.log(`[quota-retry] ${providerID} 配额耗尽(attempt=${evt?.attempt}), ${humanWait(delay)}后重试`)
     })
 
@@ -266,6 +307,12 @@ export default {
             }
             if (type === "session.execution.interrupted") {
               stopped.add(data.sessionID)
+              disarmHeartbeat(String(data.sessionID ?? ""))
+              continue
+            }
+            if (type === "session.step.started") {
+              // 等待结束、步骤已开始 → 不再需要心跳(下一次等待会重新 arm)
+              disarmHeartbeat(String(data.sessionID ?? ""))
               continue
             }
             if (type === "session.execution.succeeded") {
@@ -337,6 +384,8 @@ export default {
 
     // 卸载: setup 返回 cleanup(2.0 由宿主在插件卸载时调用)
     return () => {
+      clearInterval(heartbeatTimer)
+      heartbeats.clear()
       recent429.clear()
       zhipuCache.clear()
       rounds.clear()
