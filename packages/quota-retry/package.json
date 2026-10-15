@@ -1,0 +1,9 @@
+{
+  "name": "@buraunkan/quota-retry",
+  "version": "2.0.0-alpha.0",
+  "description": "opencode 2.0 plugin: quota-aware native retry (unlimited wait per attempt)",
+  "type": "module",
+  "exports": {
+    "./server": "./server.ts"
+  }
+}

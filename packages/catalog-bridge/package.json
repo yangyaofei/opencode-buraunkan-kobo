@@ -1,0 +1,9 @@
+{
+  "name": "@buraunkan/catalog-bridge",
+  "version": "2.0.0-alpha.0",
+  "description": "opencode 2.0 plugin: fill model metadata for custom providers from models.dev",
+  "type": "module",
+  "exports": {
+    "./server": "./server.ts"
+  }
+}

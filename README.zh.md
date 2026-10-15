@@ -1,309 +1,56 @@
-# Buraunkan Kobo
+# Buraunkan Kobo（ブラウン管工房）
 
-[English](README.md) | [中文](README.zh.md)
+**opencode 2.0** 的插件工房：多个互相独立的插件放在同一个仓库里，各自启用、删掉一行即停用。
 
-Buraunkan Kobo（布朗管工房）是未来道具研究所（Mirai Gadget
-Kenkyujo）的一楼——让未来道具 8 号机「电话微波炉（暂定）」（Mirai Gadget
-8-goki "Denwa Renji (Kari)"）真正运转的 Lifter。
+> 1.x 的实现（二进制补丁、安装别名那一套）保留在 [`legacy`](https://github.com/yangyaofei/opencode-buraunkan-kobo/tree/legacy) 分支。默认分支上的内容全部面向 opencode 2.0。
 
-## 插件（未来道具）
+## 插件
 
-1. **quota-retry** —— 拦截配额耗尽的 429，注入精确的 `retry-after-ms`，让
-   opencode 在限额重置后再重试，而不是原生退避约 70 秒后放弃；可选二进制补丁
-   把硬编码的重试上限变为可配置。另支持 **on-demand 虚模型**：配额耗尽时不死等，
-   自动按链降级到其他 provider/模型——见 [on-demand 虚模型](#on-demand-虚模型可选)。
-2. **session-reaper** —— pipeline session 治理。`/session-reaper run` 声明
-   会话身份并逐字透传 prompt，下次运行时自动清理超期 session（级联删除全部
-   subagent 子会话）。
-3. **catalog-bridge** —— 自定义 provider 的模型自动从 models.dev 复用元数据
-   （limit / cost / reasoning / variants 等）；逐字段补缺失，不覆盖已手写的值。
+| 包 | 作用 |
+|---|---|
+| [`packages/quota-retry`](packages/quota-retry) | 配额感知重试。识别配额类 429，精确等待到配额重置（等待不封顶），并在 opencode 原生 10 次上限耗尽后**无限轮次**继续重试。 |
+| [`packages/session-reaper`](packages/session-reaper) | 会话登记 + 按流水线收割（`keepDays` / `maxSessions`），用 synthetic 消息回执，走原生会话 API 删除。 |
+| [`packages/catalog-bridge`](packages/catalog-bridge) | 为自定义 provider 的模型补全元数据（上下文/输出上限、价格、能力、变体），数据来自 [models.dev](https://models.dev)。 |
 
 ## 安装
 
 ```jsonc
 // ~/.config/opencode/opencode.jsonc
 {
-  "plugin": [
-    "catalog-bridge@git+https://github.com/yangyaofei/opencode-buraunkan-kobo.git",
-    "quota-retry@git+https://github.com/yangyaofei/opencode-buraunkan-kobo.git",
-    "session-reaper@git+https://github.com/yangyaofei/opencode-buraunkan-kobo.git"
+  "plugins": [
+    "git+https://github.com/yangyaofei/opencode-buraunkan-kobo.git#v2::path:packages/quota-retry",
+    "git+https://github.com/yangyaofei/opencode-buraunkan-kobo.git#v2::path:packages/session-reaper",
+    "git+https://github.com/yangyaofei/opencode-buraunkan-kobo.git#v2::path:packages/catalog-bridge"
   ]
 }
 ```
 
-`@` 前的别名就是插件的身份与开关：删一行即停用；行尾可钉 `#commit` / `#branch`。
-三个别名各自独立安装（各自缓存副本），是三个独立插件，可分别启用/停用/钉版本。
+本地路径写法相同（`"/本仓库路径/packages/quota-retry"`），开发时就是这么用的。
 
-## quota-retry
-
-### 解决的问题
-
-opencode 1.18.12 起把重试次数上限固定为 5。coding plan 配额耗尽后，5 次重试只
-覆盖约 70 秒，会话直接中断——但错误信息里已经写明配额几小时后才重置。
-
-无人值守任务等重置没问题；但有时需要"现在就跑完"。这时可以用本插件注册的
-*on-demand 虚模型*：配额耗尽自动按链降级到下一个 provider/模型——配置见
-[on-demand 虚模型](#on-demand-虚模型可选)。
-
-### 工作原理
-
-opencode 按响应头决定等待时间：`retry-after-ms` > `retry-after` > 指数退避。
-本插件拦截配置中 provider 的 429 响应，用判定正则 `quotaMatch` 读响应内容：
-
-- 配额耗尽（如智谱「已达到 5 小时的使用上限」、火山「exceeded the monthly
-  usage quota」）→ 计算「距限额重置还剩多久」，写入 `retry-after-ms` 后交还。
-  第一次原生重试就落在限额重置之后。
-- 没匹配上（如并发限流「Requests are too frequent」）→ 不注入，原样交还，
-  opencode 原生指数退避。
-
-重置时刻来源（provider 的 `quota` 字段）：`"zhipu"` 用智谱配额查询接口（精确），
-失败回退 `resetExtract` 提取；`"body"` 只用 `resetExtract`（火山用这个）。
-
-### 配置
-
-全局 `~/.config/opencode/quota-retry.jsonc`，项目 `.opencode/quota-retry.jsonc`
-优先。一条配置可覆盖一个或多个 provider（`id` 数组 / `idPattern` 正则）：
-
-```jsonc
-{
-  "providers": [
-    {
-      "id": "zhipuai-coding-plan",   // 单个 opencode providerID
-      "quota": "zhipu",              // 重置时间来源: zhipu | body
-      "fallbackWaitMs": 30000,       // 拿不到重置时间时每次重试等多久(毫秒)
-      "bufferMs": 10000              // 在计算出的等待上额外加的缓冲(毫秒)
-    },
-    {
-      // 同族 provider 一条覆盖: id 数组或 idPattern 正则任选其一, 也可同时用
-      "id": ["volces-ark", "volces-ark-agent-plan"],
-      "quota": "body",
-      // 判定 429 是不是配额耗尽(不匹配则透传, 走 opencode 原生重试)
-      "quotaMatch": "AccountQuotaExceeded|exceeded the .*usage quota",
-      // 从 429 正文提取重置时刻, 捕获组 1 = 完整时间串
-      "resetExtract": "reset at\\s+((?:\\d{4}-\\d{2}-\\d{2})\\s+\\d{2}:\\d{2}:\\d{2})",
-      "fallbackWaitMs": 30000,
-      "bufferMs": 10000
-    },
-    {
-      "id": "zhipu-fallback",        // 正则只匹配 opencode 已配置的 providerID
-      "idPattern": "^zhipu-",        // 命中的每个 provider 都归入本条
-      "quota": "body"
-    }
-  ],
-  "quotaCacheMs": 60000              // 配额查询结果缓存时长(毫秒)
-}
-```
-
-| 字段 | 必填 | 说明 |
-|---|---|---|
-| `id` | 是* | opencode 的 providerID，如 `zhipuai-coding-plan`、`volces-ark`；也接受 ID 数组一次覆盖多个。*与 `idPattern` 至少配一个 |
-| `idPattern` | 否 | 正则（i 标志）对 opencode 已配置的 providerID 求匹配，命中的都归入本条；同一 providerID 命中多条配置时先到先得 |
-| `quota` | 是 | 重置时刻来源：`zhipu`（配额查询接口，失败回退 `resetExtract`）或 `body`（只用 `resetExtract`） |
-| `quotaMatch` | 否 | 判定 429 是不是配额耗尽的正则；不匹配的 429 不注入，走原生重试 |
-| `resetExtract` | 否 | 从 429 正文提取重置时刻的正则，捕获组 1 = 完整时间串；无时区后缀按 +08:00 |
-| `quotaUrl` | 否 | 配额查询接口地址，默认智谱官方地址 |
-| `apiKey` | 否 | 配额查询用的 key；不填则取本次请求头 Authorization，再读 auth.json |
-| `fallbackWaitMs` | 否 | 确认配额耗尽但拿不到精确时间时的等待（默认 30000） |
-| `bufferMs` | 否 | 附加缓冲（默认 10000）；重置时刻附近服务端可能未生效，多等几秒 |
-| `quotaCacheMs` | 否 | 全局；配额查询缓存（默认 60000） |
-
-两组正则有内置默认值，不配也支持智谱和火山。改配置后重启 opencode 生效。
-
-### on-demand 虚模型（可选）
-
-存量模型完全不动。可以额外注册一个"调度"模型：按 chain 顺序依次尝试真实模型，
-配额耗尽 429 自动降级到下一个--适合"现在就要跑完"的场景（付费 API 顶上）；
-而能接受等配额的夜间任务继续选原模型，触发方式不变。
-
-挂载组**不需要在 opencode 自己的 config 里定义**：`provider` 不存在时，
-quota-retry 会在 config hook 里自动创建——`npm` 默认 `@ai-sdk/openai-compatible`，
-`baseURL` + `apiKey` 从链首跳目标继承（config `options` 优先，其次 auth.json），
-即使插件拦截失效，裸请求也带有效鉴权。可选逐条目覆盖：`providerName`
-（分组显示名）、`npm`。需要完全手工控制时才在 opencode.jsonc 手写该组——
-用户已写的组不会被覆盖。模型 ID 与真实模型同名，catalog-bridge 可直接桥接元数据：
-
-```jsonc
-// ~/.config/opencode/quota-retry.jsonc
-{
-  "providers": [ /* 原有配置, 不变 */ ],
-  "onDemandModels": [
-    {
-      "model": "glm-5.3-flash",              // 与真实模型同名
-      "provider": "fallback-providers",      // 自动创建的组, 无需 opencode.jsonc
-      "name": "GLM-5.3-Flash (Fallback)",
-      "providerName": "Fallback",            // 可选: 覆盖分组显示名
-      "chain": [
-        { "provider": "zhipuai-coding-plan", "model": "glm-5.3-flash" },  // 订阅额度
-        { "provider": "zhipuai", "model": "glm-5.3-flash" }               // 付费 API
-      ]
-    }
-  ]
-}
-```
-
-行为：
-
-- 选中虚模型时，按 chain 逐跳改写 `body.model` 转发；第一个非 429 响应即返回。
-  每跳都重定向到目标 provider 的 baseURL，并换 Authorization key
-  （config `options.apiKey` 优先，其次 auth.json）。
-- 非配额 429（并发限流）不烧链，原样交还 opencode 原生重试。
-- 整链耗尽 -> 返回裸 429（不注入等待）；配合二进制补丁，原生重试每 ~30s
-  重扫整链，哪个模型先恢复配额就用哪个。
-- 不在链里的模型行为与之前完全一致（配额 429 -> 注入 `retry-after-ms` 等重置）。
-- TUI 元数据（limit 等）从 chain 首目标的 models.dev catalog 条目复制。
-- 挂载组缺失时自动创建；链首跳在任何地方都解析不到的条目跳过注册并 toast 警告。
-
-### 二进制补丁（可选）
-
-上游把重试策略硬编码（`maxRetries` = 5 封顶、退避、退避封顶，由
-[PR #41939](https://github.com/anomalyco/opencode/pull/41939) 引入，无任何配置项）；
-[PR #44517](https://github.com/anomalyco/opencode/pull/44517) 通过增加 `maxRetry`
-等配置项解决此问题，合并后二进制补丁即失效，插件只剩配额 429 的等待时间注入功能。
-上面的注入方案解决配额场景的「等多久」，但两件事够不到：
-
-- **次数上限**：持续故障下 5 次 × 30s ≈ 2.5 分钟就放弃
-- **退避无封顶**：响应无 retry-after 头时（并发限流、网络错误），指数退避
-  无限翻倍，实测 38.4s/76.2s 一路加倍
-
-本插件可在启动时等长改写 opencode 二进制里的这些常量（opt-in）：
-
-```jsonc
-{
-  "providers": [ /* 同上 */ ],
-  "patch": {
-    "enabled": true,
-    "maxRetries": -1,        // -1 无限 | 1-99 指定次数
-    "backoffCapMs": 30000    // 可选: 无头退避封顶(10s-16.6min)
-  }
-}
-```
-
-- 下次启动生效；备份 `.retry-bak` 始终保持出厂态；`{"patch": {"enabled": false,
-  "restore": true}}` 还原出厂二进制
-- 组合约束（等长替换的位预算）：`backoffCapMs` ≥ 100000 时 `maxRetries` 仅支持
-  -1 或 1-9；无效配置入口校验拒绝，toast 提示且不碰二进制
-- 覆盖所有平台变体二进制；npm 升级覆盖后自动重打；macOS 自动
-  `codesign -f -s -` 重签名
-- 状态缓存 `~/.cache/opencode/quota-retry-patch-state.json`（size + mtime +
-  已应用目标），稳态启动零开销
-
-### 查询当前生效状态
-
-opencode 里输入 `/retry-setting`：输出实际使用的配置文件路径、providers 与
-patch 配置、每份二进制重试参数的**实际值**与配置期望逐项对照。只读、不调模型
-（`command.execute.before` 本地接管，报告以 ignored 消息写入会话）。同时注册为
-`quota_retry_status` 工具，会话里直接问也行。
-
-## session-reaper
-
-scheduled pipeline（OpenChamber schedule / `opencode run`）每次运行留下 1 个主
-session + 数十个 subagent 子会话，无人治理时 opencode.db 无限膨胀（实测 3 个月
-12GB）。本插件把「登记 + 清理」内化到 opencode 进程内。
-
-```
-/session-reaper run --pipeline <name> <原始prompt>   执行任务 + 治理
-/session-reaper status                               查看各 pipeline 桶状态与超期项
-/session-reaper set --pipeline <name> [--keep-days N] [--max-sessions M] [--remove]
-                                                      配置 upsert(不带修改参数=查看)
-/session-reaper reap --pipeline <name>               立即清理该 pipeline
-```
-
-- `run`：清理超期项 → 登记当前 sessionID → **agent 收到逐字原样的 prompt**
-  （hook 改写 output.parts，剥掉 action 与 flags）
-- `status` / `set` / `reap`：零模型路径（本地处理写入会话，不耗 token）
-- 删除顺序：先删 keepDays 过期的，再删超出 maxSessions 的最老项；删除失败留桶
-  里下次重试
-
-配置（`~/.config/opencode/session-reaper.jsonc`）：
-
-```jsonc
-{
-  "defaultKeepDays": 30,
-  "defaultMaxSessions": 10,
-  "pipelines": {
-    "twitter-daily": { "keepDays": 10, "maxSessions": 10 },
-    "work-weekly": { "keepDays": 30, "maxSessions": 5 }
-  }
-}
-```
-
-未配置的 pipeline 用 `default*`；default 也未设 → 只登记不清理（安全默认）。
-删除走 `DELETE /session/:id`，级联删除全部 subagent 子会话；404 视为已清理。
-`set` 后文件被程序重写为纯 JSON（注释归程序管）。
-
-`maxSessions` 的语义是**保留的历史条数，不是桶内总数上限**：`run` 先按上限裁剪
-历史，再登记当前 session（本次不参与裁剪），所以每次 run 结束时桶内为
-`maxSessions + 1` 条（N 条历史 + 当前 1 条），超出部分由下次 run 修正。
-例：`maxSessions: 2` 时会看到 3 个 session，属预期行为。
-
-### 行为日志
-
-每次 `run` / `reap` / `set` 追加一条 JSONL 到 registry 同目录的 `log.jsonl`
-（默认 `~/.local/state/opencode/session-reaper/log.jsonl`），保留最近
-`logKeep` 条（默认 100，设 0 关闭）：
-
-```jsonc
-{"ts":1735036800000,"event":"run","pipeline":"twitter-daily","sessionID":"ses_c","registered":"ses_c","expired":1,"overflow":0,"reaped":["ses_a"],"failed":[],"bucket":2}
-{"ts":1735036900000,"event":"reap","pipeline":"twitter-daily","sessionID":"ses_d","expired":0,"overflow":1,"reaped":["ses_b"],"failed":[],"bucket":1}
-{"ts":1735037000000,"event":"set","pipeline":"twitter-daily","sessionID":"ses_d","change":{"maxSessions":2}}
-```
-
-字段：`registered` 本次新增的 sessionID、`expired`/`overflow` 过期与超出数量、
-`reaped` 删除成功的 ID 列表、`failed` 删除失败（留桶重试）的 ID 列表、
-`bucket` 操作后的桶内总数。
-
-调用示例（OpenChamber schedule 的 prompt 字段或 TUI）：
-
-```
-/session-reaper run --pipeline twitter-daily 生成今天的推特日报
-```
-
-## catalog-bridge
-
-opencode 按 **providerID** 匹配 models.dev 元数据——自定义 provider 名下所有
-模型的元数据全空（TUI 里 limit 显示 0）。本插件在 config 解析后逐字段补缺失。
-
-核心约定：**模型外层 key 必须对齐 models.dev 里的模型名**（如 `glm-5.2`）。
-endpoint 真实 API 名不同时，条目内用 `id` 指定：
-
-```jsonc
-{
-  "provider": {
-    "my-gateway": {
-      "npm": "@ai-sdk/openai-compatible",
-      "options": { "baseURL": "https://your-endpoint/v1", "apiKey": "sk-xxx" },
-      "models": {
-        "glm-5.2": { "id": "vibe-bot/glm-5.2", "name": "GLM 5.2 (我的网关)" }
-      }
-    }
-  }
-}
-```
-
-补全字段：`limit`、`cost`、`reasoning`、`tool_call`、`attachment`、
-`temperature`、`family`、`release_date`、`interleaved`、`modalities`、`status`、
-`experimental`、`variants`、`options.reasoningEffort`——全部逐字段，不覆盖已
-手写的值。依赖 models.dev 缓存（`~/.cache/opencode/models.json`，首次联网自动
-拉取）；未收录的模型跳过不报错。
-
-## 自更新
-
-opencode 对 git 插件只装一次、不再拉取。本仓库插件共享一份节流检查
-（`~/.cache/opencode/buraunkan-kobo/sync.json`，默认 24h）：窗口内第一个加载的
-插件用 `git ls-remote` 比对远端 HEAD；有新提交则删除自己的 wrapper，下次启动
-opencode 原生补装最新版（**发布后需重启两次**）。钉 commit sha 的安装不自动更新。
-
-```jsonc
-// ~/.config/opencode/buraunkan-kobo.jsonc
-{
-  "sync": { "enabled": true, "throttleHours": 24, "repo": "yangyaofei/opencode-buraunkan-kobo" }
-}
-```
+- **一个包 = 一个插件**。2.0 的加载契约是默认导出 `{ id, setup }`；删掉那一行即停用。
+- `session-reaper` 的删除需要 opencode ≥ 2.0.24（走原生 `session.remove`；更低版本会报错而不是删除）。
+- 每个包自己的 README 里有各自的配置说明；1.x ↔ 2.0 的逐项对照见 [docs/v1-v2-parity.md](docs/v1-v2-parity.md)。
 
 ## 目录
 
 ```
-index.ts        只导出插件函数(非函数导出会导致模块加载失败)
-plugins/*.ts    各插件实现
-shared/         gate(别名自门控) / jsonc / paths / fsutil / reply / sync
+packages/
+  quota-retry/       opencode 2.0 插件（server.ts / core.ts / config.ts / 测试 / README）
+  session-reaper/    opencode 2.0 插件（server.ts / reaper.ts / 测试 / README）
+  catalog-bridge/    opencode 2.0 插件（server.ts / catalog.ts / 测试 / README）
+  openchamber-mcp/   OpenChamber 扩展：用于会话编排的 MCP server
+docs/
+  v1-v2-parity.md    1.x → 2.0 的功能逐项对照与已知缺口
 ```
+
+## 开发
+
+```bash
+bun test ./packages/quota-retry ./packages/session-reaper ./packages/catalog-bridge
+```
+
+三个 opencode 插件共 61 个单测。除 Bun 与 `node:` 内置模块外不依赖任何东西——宿主 API 由 opencode 在加载时注入。
+
+## License
+
+MIT
