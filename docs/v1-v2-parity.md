@@ -45,7 +45,7 @@
 3. **每轮边界多一个 title 重生成请求**（synthetic 驱动新执行触发，约 1 次 msgs=2 小请求）。已用 title hook 压制（续命期间跳过 title 重生成，G6）。
 4. **attempt 每轮从 1 重计**（V1 补丁后连续计数）。用户已确认此语义可接受（"我要看到第二轮的 attempt 2"）。
 5. **续命触发是显式策略**（`continueOn`）：默认 = 可重试类型（quota/rate-limit/internal/transport/invalid-output/unknown）+ 429/5xx，`denyTypes` 排除 auth/content-filter/invalid-request/unsupported-operation/no-route；可用 `types`/`statuses`/`match` 覆盖。V1 补丁是"任何原生可重试错误"都无限重试 —— 默认已对齐该语义。
-6. **长等待必须分段**（`waitSegmentMs`，默认 45 分钟）：opencode 的 location 不活动回收在 60 分钟无 durable 会话事件时以 `reason: "inactivity"` 打断正在等待的执行（`packages/core/src/location-activity.ts`：TTL 写死 `"60 minutes"`、只被 durable 会话事件刷新、无配置口；2.0.15 与 2.0.28 逐行相同）。"等待配额重置"期间不产生事件 → 超过 60 分钟的等待必然被掐断（实测：等待开始后 61 分钟 `location services evicted` + `outcome=interrupted`，retry 状态被 idle 投影清掉）。分段后每段结束重试一次 → 发布 `session.retry.scheduled` → 刷新 TTL；总等待仍精确落在重置点，代价是每段一次立即返回的 429。V1 无此约束（1.x 无 location 回收）。上游已提：#51343（评论）、#55305（评论，可配置 TTL）；已开的 PR（#50499/#51583/#53238）只解决"别打断活着的执行"、**明确保留一小时 TTL**。
+6. **平台约束：长等待会被 60 分钟 TTL 掐断**（我们不改变等待形态，等待仍是一次到重置点）：opencode 的 location 不活动回收在 60 分钟无 durable 会话事件时以 `reason: "inactivity"` 打断正在等待的执行（`packages/core/src/location-activity.ts`：TTL 写死 `"60 minutes"`、只被"带 location 的 durable 会话事件"刷新、无配置口；2.0.15 与 2.0.28 逐行相同）。"等待配额重置"期间不产生事件 → 超过 60 分钟的等待会被掐断（实测：等待开始后 61 分钟 `location services evicted` + `outcome=interrupted`，retry 状态被 idle 投影清掉）。上游跟踪：#51343（评论）、#55305（评论，可配置 TTL）；已开 PR（#50499/#51583/#53238）只解决"别打断活着的执行"、**明确保留一小时 TTL**。
 
 ---
 
