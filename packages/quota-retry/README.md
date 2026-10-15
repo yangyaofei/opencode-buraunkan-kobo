@@ -7,7 +7,7 @@
 ```jsonc
 // ~/.config/opencode/opencode.jsonc
 {
-  "plugin": ["/<本仓库路径>/packages/quota-retry"]
+  "plugins": ["/<本仓库路径>/packages/quota-retry"]
 }
 ```
 
@@ -43,7 +43,7 @@
 ```jsonc
 // 1) ~/.config/opencode/opencode.jsonc — 挂载组 stub(必须, 指向链首跳)
 {
-  "plugin": ["/<仓库>/packages/quota-retry"],
+  "plugins": ["/<仓库>/packages/quota-retry"],
   "provider": {
     "fallback-providers": {
       "npm": "@ai-sdk/openai-compatible",
@@ -116,7 +116,7 @@
 
 ```jsonc
 // ~/.config/opencode/opencode.jsonc
-{ "plugin": ["/path/to/opencode-buraunkan-kobo/packages/quota-retry"] }
+{ "plugins": ["/path/to/opencode-buraunkan-kobo/packages/quota-retry"] }
 ```
 
 ## TUI 可见性

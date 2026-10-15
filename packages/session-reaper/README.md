@@ -7,7 +7,7 @@
 ```jsonc
 // ~/.config/opencode/opencode.jsonc
 {
-  "plugin": ["/<本仓库路径>/packages/session-reaper"]
+  "plugins": ["/<本仓库路径>/packages/session-reaper"]
 }
 ```
 
@@ -51,7 +51,7 @@ registry 落 `~/.local/state/opencode/session-reaper/registry.json`（XDG_STATE_
 ## 安装
 
 ```jsonc
-{ "plugin": ["/path/to/opencode-buraunkan-kobo/packages/session-reaper"] }
+{ "plugins": ["/path/to/opencode-buraunkan-kobo/packages/session-reaper"] }
 ```
 
 ## 测试

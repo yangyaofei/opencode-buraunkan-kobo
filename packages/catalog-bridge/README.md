@@ -7,7 +7,7 @@
 ```jsonc
 // ~/.config/opencode/opencode.jsonc
 {
-  "plugin": ["/<本仓库路径>/packages/catalog-bridge"]
+  "plugins": ["/<本仓库路径>/packages/catalog-bridge"]
 }
 ```
 
