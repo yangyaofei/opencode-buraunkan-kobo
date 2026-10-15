@@ -31,6 +31,13 @@
 - `session-reaper` 的删除需要 opencode ≥ 2.0.24（走原生 `session.remove`；更低版本会报错而不是删除）。
 - 每个包自己的 README 里有各自的配置说明；1.x ↔ 2.0 的逐项对照见 [docs/v1-v2-parity.md](docs/v1-v2-parity.md)。
 
+### 更新与钉版本
+
+- 上面的写法用的是**分支**（`#v2`）。opencode 会**检测**分支上的新提交——`opencode plugin check`（TUI 插件面板亦可，检测结果缓存 24 小时）会把它标成 `outdated`——但**不会自动替换**：正常启动走的是"复用已安装副本"（`install=false`）。要真正拉取新版本，执行 **`opencode plugin update`**（或 TUI 插件面板里的更新动作；对应 `plugin.update` API）。
+- 想**钉死**版本：把 `#v2` 换成完整的 commit sha（`#<40 位 sha>`）。带 sha 的规格在 opencode 里是"不可变"的（`Npm.check` 直接返回 false），不会被判定为有更新。
+- 本地路径安装（`"/path/to/repo/packages/quota-retry"`）是**就地读取**：改文件后重启即生效，不需要更新动作。
+
+
 ## 目录
 
 ```
