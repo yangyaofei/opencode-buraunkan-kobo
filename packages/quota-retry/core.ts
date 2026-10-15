@@ -39,12 +39,20 @@ export type PluginConfig = {
   maxRounds?: number
   // 续命触发策略(默认: 可重试错误类型 + 429/5xx)。
   continueOn?: ContinuePolicy
+  // 长等待分段上限(ms)。opencode 的 location 不活动回收在 60 分钟无 durable 事件时
+  // 会以 reason="inactivity" 打断正在等待的执行(core/src/location-activity.ts),
+  // 长等待因此必然每 60 分钟被掐一次。分段后每段结束重试一次 → 立即拿到 429 并产生
+  // durable 事件(session.retry.scheduled)刷新该 TTL, 总等待仍精确落在重置点。
+  // 默认 45 分钟(留 15 分钟余量); 0 = 不分段。
+  waitSegmentMs?: number
 }
 
 export const DEFAULT_QUOTA_URL = "https://open.bigmodel.cn/api/monitor/usage/quota/limit"
 export const DEFAULT_FALLBACK_WAIT_MS = 30_000
 export const DEFAULT_BUFFER_MS = 10_000
 export const DEFAULT_QUOTA_CACHE_MS = 60_000
+// 长等待分段上限默认值: 45 分钟(低于 opencode location 回收的 60 分钟 TTL, 留 15 分钟余量)
+export const DEFAULT_WAIT_SEGMENT_MS = 45 * 60 * 1000
 // 判定 429 是不是配额耗尽的默认正则(智谱+火山特征)
 export const DEFAULT_QUOTA_MATCH = 'AccountQuotaExceeded|usage quota|使用上限|限额将在|"code"\\s*:\\s*"1308"'
 // 从 body 提取重置时间的默认正则(捕获组 1 = 完整时间串)
@@ -109,6 +117,17 @@ export function computeWaitMs(opts: {
       ? opts.resetAtMs - opts.now + buffer
       : fallback
   return Math.max(min, Math.ceil(base))
+}
+
+// 把长等待切成 <= waitSegmentMs 的段(0 / 负数 / 非有限值 = 不分段)。
+// 目的: 每段结束时原生重试一次 → 立即得到 429 并发布 durable 事件(session.retry.scheduled),
+// 从而刷新 opencode 的 location 不活动 TTL(默认 60 分钟); 否则长等待必然被回收打断。
+// 最后一段自然落在重置点: delay = min(剩余等待, 段长)。
+export function applyWaitSegment(delayMs: number, waitSegmentMs?: number): number {
+  const segment = waitSegmentMs ?? DEFAULT_WAIT_SEGMENT_MS
+  if (!Number.isFinite(delayMs) || delayMs <= 0) return delayMs
+  if (!Number.isFinite(segment) || segment <= 0) return delayMs
+  return Math.min(delayMs, segment)
 }
 
 // 智谱配额 API: 取所有"已耗尽"限额里最早的重置时刻(绝对 ms); 失败返回 NaN。

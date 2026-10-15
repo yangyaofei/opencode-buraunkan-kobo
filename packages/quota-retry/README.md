@@ -102,6 +102,7 @@
   ],
   "quotaCacheMs": 60000,
   "maxRounds": -1,
+  "waitSegmentMs": 2700000,   // 长等待分段上限(默认 45 分钟; 0 = 不分段)
   // 续命触发策略(可选; 缺省 = 可重试类型 + 429/5xx)
   "continueOn": {
     "types": ["provider.quota", "provider.rate-limit", "provider.internal", "provider.transport"],
@@ -114,6 +115,7 @@
 
 - `continueOn.types` / `statuses` / `match` 任一命中即续命；`denyTypes` 优先（默认含 auth/content-filter/invalid-request/unsupported-operation/no-route）。要在默认 deny 的类型上续命，需显式把它从 `denyTypes` 移除（如 `"denyTypes": []`）。
 - `continueOn.statuses` 缺省 = 429 与全部 5xx。
+- `waitSegmentMs`（默认 2700000 = 45 分钟）：把长等待切成若干段。**为什么需要**——opencode 的 location 不活动回收在 60 分钟内没有 durable 会话事件时会以 `reason: "inactivity"` 打断正在等待的执行（`packages/core/src/location-activity.ts`，TTL 写死 60 分钟、无配置口），而"等待配额重置"期间不产生任何事件，所以超过 60 分钟的等待必然被掐断（实测：等待开始后 61 分钟 `location services evicted` + `outcome=interrupted`，retry 状态被 idle 投影清掉）。分段后每段结束时原生重试一次 → 立即拿到 429 并发布 `session.retry.scheduled` → 刷新该 TTL；**总等待仍精确落在重置点**（最后一段 = 剩余等待）。代价：每段多一次立即返回的 429 请求（无 token 消耗）。设 `0` 可关闭分段（保留原始的单次长等待）。
 
 ## 安装
 

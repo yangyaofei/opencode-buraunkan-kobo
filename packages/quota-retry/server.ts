@@ -24,10 +24,12 @@
 //      chunk 是 JSC bytecode, 明文补丁无效 — 已实验证明)
 //   ✅ TUI 可见性(原生徽标 + 每轮覆写的通知行 "quota-retry · 第 N 轮")
 //   ✅ quota_retry_status 工具 / retry-setting 命令(零模型回复)
-//   ✅ on-demand 降级链(config stub 挂载组 + http hook 链改写 + 死亡标记)
+//   ✅ 长等待分段(绕开 opencode location 不活动回收的 60 分钟 TTL, 见 waitSegmentMs)
+//   ❌ on-demand 降级链: 已移除(2.0 无模型路由能力; 见 issue #2)
 
 import { appendFileSync, mkdirSync } from "node:fs"
 import {
+  applyWaitSegment,
   computeWaitMs,
   expandProviders,
   isQuotaError,
@@ -38,6 +40,7 @@ import {
   zhipuResetAtMs,
   DEFAULT_QUOTA_CACHE_MS,
   DEFAULT_FALLBACK_WAIT_MS,
+  DEFAULT_WAIT_SEGMENT_MS,
   MARKER_TEXT_PREFIX,
   type PluginConfig,
   type ProviderConfig,
@@ -207,9 +210,15 @@ export default {
         const captured = recent429.get(sessionID)
         if (captured) resetAtMs = parseResetAtMs(captured.text, p?.resetExtract)
       }
-      const delay = computeWaitMs({ now, resetAtMs, bufferMs: p?.bufferMs, fallbackWaitMs: p?.fallbackWaitMs })
+      const wait = computeWaitMs({ now, resetAtMs, bufferMs: p?.bufferMs, fallbackWaitMs: p?.fallbackWaitMs })
+      const delay = applyWaitSegment(wait, cfg?.waitSegmentMs)
       evt.decision = { retry: true, delay }
-      console.log(`[quota-retry] ${providerID} 配额耗尽(attempt=${evt?.attempt}), ${humanWait(delay)}后重试`)
+      const segment = cfg?.waitSegmentMs ?? DEFAULT_WAIT_SEGMENT_MS
+      console.log(
+        delay < wait
+          ? `[quota-retry] ${providerID} 配额耗尽(attempt=${evt?.attempt}), 分段等待 ${humanWait(delay)}(总计 ${humanWait(wait)}, 每段 ${humanWait(segment)} 以免被 60 分钟不活动回收打断)`
+          : `[quota-retry] ${providerID} 配额耗尽(attempt=${evt?.attempt}), ${humanWait(delay)}后重试`,
+      )
     })
 
     // ── 部件 2: 轮次续命 — 10 次耗尽 → 空标记驱动新一轮(纯插件 API, 零进程外依赖) ──

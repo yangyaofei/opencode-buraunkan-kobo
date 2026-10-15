@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import {
+  applyWaitSegment,
   computeWaitMs,
   expandProviders,
   isQuotaError,
@@ -11,6 +12,7 @@ import {
   type PluginConfig,
   xdgDataDir,
   zhipuResetAtMs,
+  DEFAULT_WAIT_SEGMENT_MS,
 } from "./core"
 
 describe("expandProviders", () => {
@@ -239,6 +241,28 @@ describe("shouldContinue(续命触发策略)", () => {
   test("空错误不续命", () => {
     expect(shouldContinue(undefined, undefined)).toBe(false)
     expect(shouldContinue(null, undefined)).toBe(false)
+  })
+})
+
+describe("applyWaitSegment", () => {
+  test("短于段长的等待保持不变", () => {
+    expect(applyWaitSegment(5_000, 2_700_000)).toBe(5_000)
+  })
+  test("超过段长的等待被切到段长", () => {
+    expect(applyWaitSegment(3 * 3600_000, 2_700_000)).toBe(2_700_000)
+  })
+  test("缺省段长 = 45 分钟", () => {
+    expect(DEFAULT_WAIT_SEGMENT_MS).toBe(45 * 60 * 1000)
+    expect(applyWaitSegment(3 * 3600_000)).toBe(DEFAULT_WAIT_SEGMENT_MS)
+  })
+  test("0 / 负数 / 非有限值 = 不分段", () => {
+    expect(applyWaitSegment(3 * 3600_000, 0)).toBe(3 * 3600_000)
+    expect(applyWaitSegment(3 * 3600_000, -1)).toBe(3 * 3600_000)
+    expect(applyWaitSegment(3 * 3600_000, Number.NaN)).toBe(3 * 3600_000)
+  })
+  test("非法 delay 原样返回", () => {
+    expect(applyWaitSegment(Number.NaN, 2_700_000)).toBeNaN()
+    expect(applyWaitSegment(0, 2_700_000)).toBe(0)
   })
 })
 
