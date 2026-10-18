@@ -9,6 +9,10 @@ export type ProviderConfig = {
   id: string | string[]
   // 对 opencode 已配置的 providerID 做正则匹配(i 标志)
   idPattern?: string
+  // 判定"配额类响应"的状态码白名单(默认 [429], 与 1.x 写死的入口一致)。
+  // 响应状态码命中这里、且正文命中 quotaMatch(默认 DEFAULT_QUOTA_MATCH)时按配额处理
+  // (精确等待); 否则原样放行, 交回 opencode 原生退避(非配额 429 如并发限流即走此路)。
+  statuses?: number[]
   quota: "zhipu" | "body"
   quotaUrl?: string
   quotaMatch?: string
@@ -55,6 +59,8 @@ export const DEFAULT_QUOTA_CACHE_MS = 60_000
 export const DEFAULT_HEARTBEAT_MS = 45 * 60 * 1000
 // 判定 429 是不是配额耗尽的默认正则(智谱+火山特征)
 export const DEFAULT_QUOTA_MATCH = 'AccountQuotaExceeded|usage quota|使用上限|限额将在|"code"\\s*:\\s*"1308"'
+// 判定"配额类响应"的默认状态码。1.x 写死 429; 2.0 起可由 provider.statuses 覆盖。
+export const DEFAULT_QUOTA_STATUSES = [429]
 // 从 body 提取重置时间的默认正则(捕获组 1 = 完整时间串)
 export const DEFAULT_RESET_EXTRACT = "((?:\\d{4}-\\d{2}-\\d{2})[\\sT]\\d{2}:\\d{2}:\\d{2})"
 
@@ -88,6 +94,20 @@ export function isQuotaText(text: string, quotaMatch?: string): boolean {
 export function isQuotaError(type: string | undefined, message: string, quotaMatch?: string): boolean {
   if (type === "provider.quota") return true
   return isQuotaText(message, quotaMatch)
+}
+
+// 2.0 的主判定入口(对齐 1.x 的响应驱动): 用 http.response 捕获到的原始响应判定——
+// 状态码命中 statuses(默认 [429])且正文命中 quotaMatch 才算"配额耗尽"。
+// 非配额 429(并发限流等)与其它状态码一律放行, 与 1.x "非配额 429 不注入" 的行为一致。
+export function isQuotaResponse(
+  status: number | undefined | null,
+  text: string,
+  p?: { statuses?: number[]; quotaMatch?: string },
+): boolean {
+  const s = Number(status)
+  if (!Number.isFinite(s)) return false
+  if (!(p?.statuses ?? DEFAULT_QUOTA_STATUSES).includes(s)) return false
+  return isQuotaText(text, p?.quotaMatch)
 }
 
 // 从 429 body 提取重置时刻(捕获组 1 = 完整时间串); 无时区后缀按 +08:00 解析。
