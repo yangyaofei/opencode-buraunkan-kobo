@@ -32,7 +32,7 @@ import {
   computeWaitMs,
   expandProviders,
   isQuotaError,
-  isQuotaText,
+  isQuotaResponse,
   needsHeartbeat,
   parseResetAtMs,
   shouldContinue,
@@ -41,6 +41,7 @@ import {
   DEFAULT_QUOTA_CACHE_MS,
   DEFAULT_FALLBACK_WAIT_MS,
   DEFAULT_HEARTBEAT_MS,
+  DEFAULT_QUOTA_STATUSES,
   MARKER_TEXT_PREFIX,
   type PluginConfig,
   type ProviderConfig,
@@ -112,7 +113,7 @@ export default {
     }
 
     // ── 会话内状态 ──
-    const recent429 = new Map<string, { at: number; text: string }>() // sid -> 最近 429 body
+    const recent429 = new Map<string, { at: number; status: number; text: string }>() // sid -> 最近一次"配额类状态码"响应
     const zhipuCache = new Map<string, { at: number; resetAt: number }>() // providerID -> 精确重置时刻缓存
     const rounds = new Map<string, number>() // sid -> 当前 turn 已续命轮数
     const stopped = new Set<string>() // 用户接管/中断后不再续命
@@ -143,7 +144,8 @@ export default {
           if (now < due) continue
           heartbeats.set(sid, now + heartbeatMs)
           try {
-            await ctx.session.synthetic(sid, {
+            await ctx.session.synthetic({
+              sessionID: sid,
               id: `msg_${MARKER_TEXT_PREFIX}_hb_${now.toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
               text: `${MARKER_TEXT_PREFIX}-hb-${Math.random().toString(36).slice(2, 10)}`,
               description: `${MARKER_TEXT_PREFIX} · 等待心跳 · 内部标记(不发给模型)`,
@@ -204,15 +206,21 @@ export default {
       evt.result = ""
     })
 
-    // ── 部件 1a: 抓 429 body(retry 事件的 error 不带 body, 需从 http.response 捕获) ──
+    // ── 部件 1a: 抓"配额类状态码"的响应本体 ──
+    // retry 事件的 error 不带 body, 且首次失败时错误文案未必含配额特征(1.x 直接看响应,
+    // 所以第一次就接管)。这里按 provider.statuses(默认 [429]) 捕获原始响应,
+    // 判定放在 retry hook 里做(与 1.x 的响应驱动一致)。
     await ctx.session.hook("http.response", async (evt: any) => {
       try {
-        if (evt?.response?.status !== 429) return
-        dbg("[resp-hook] 429:", evt?.model?.providerID, evt?.kind)
-        let text = ""
+        const providerID = String(evt?.model?.providerID ?? "")
+        const p = expanded.get(providerID)
+        const statuses = p?.statuses ?? DEFAULT_QUOTA_STATUSES
+        const status = Number(evt?.response?.status)
+        if (!Number.isFinite(status) || !statuses.includes(status)) return
+        dbg("[resp-hook] quota-status:", providerID, status, evt?.kind)
         try {
-          text = await evt.response.clone().text()
-          recent429.set(String(evt.sessionID), { at: Date.now(), text })
+          const text = await evt.response.clone().text()
+          recent429.set(String(evt.sessionID), { at: Date.now(), status, text })
         } catch (err) {
           dbg("[resp-hook] clone/text err:", String(err))
         }
@@ -225,11 +233,22 @@ export default {
     await ctx.session.hook("retry", async (evt: any) => {
       const sessionID = String(evt?.sessionID ?? "")
       const providerID = String(evt?.model?.providerID ?? "")
-      dbg("[retry-hook] fired:", providerID, String(evt?.error?.type ?? ""), String(evt?.error?.message ?? "").slice(0, 60))
-      const p = expanded.get(providerID)
       const type = evt?.error?.type
       const message = String(evt?.error?.message ?? "")
-      if (!isQuotaError(type, message, p?.quotaMatch)) return
+      dbg(
+        "[retry-hook] fired:",
+        providerID,
+        String(type ?? ""),
+        String(evt?.error?.status ?? ""),
+        message.slice(0, 60),
+      )
+      const p = expanded.get(providerID)
+      const captured = recent429.get(sessionID)
+      // ① 响应驱动(对齐 1.x): 捕获到的原始响应命中"状态码 ∈ statuses + 正文命中 quotaMatch"。
+      const byResponse = captured ? isQuotaResponse(captured.status, captured.text, p) : false
+      // ② 兜底: 没抓到响应时用 opencode 归纳出的错误(type == provider.quota 或文案命中正则)。
+      const byError = !byResponse && isQuotaError(type, message, p?.quotaMatch)
+      if (!byResponse && !byError) return
 
       quotaHit.add(sessionID)
       const now = Date.now()
@@ -243,14 +262,15 @@ export default {
           if (Number.isFinite(resetAtMs)) zhipuCache.set(providerID, { at: now, resetAt: resetAtMs })
         }
       }
-      if (!Number.isFinite(resetAtMs)) {
-        const captured = recent429.get(sessionID)
-        if (captured) resetAtMs = parseResetAtMs(captured.text, p?.resetExtract)
+      if (!Number.isFinite(resetAtMs) && captured) {
+        resetAtMs = parseResetAtMs(captured.text, p?.resetExtract)
       }
       const delay = computeWaitMs({ now, resetAtMs, bufferMs: p?.bufferMs, fallbackWaitMs: p?.fallbackWaitMs })
       evt.decision = { retry: true, delay }
       armHeartbeat(sessionID, delay)
-      console.log(`[quota-retry] ${providerID} 配额耗尽(attempt=${evt?.attempt}), ${humanWait(delay)}后重试`)
+      console.log(
+        `[quota-retry] ${providerID} 配额耗尽(attempt=${evt?.attempt}, via=${byResponse ? "response" : "error"}), ${humanWait(delay)}后重试`,
+      )
     })
 
     // ── 部件 2: 轮次续命 — 10 次耗尽 → 空标记驱动新一轮(纯插件 API, 零进程外依赖) ──

@@ -18,7 +18,7 @@
 
 ## 功能
 
-- `session.retry` hook：捕获 provider 错误，识别配额类 429（`AccountQuotaExceeded` / `usage quota` / `使用上限` / code 1308），计算到配额重置时刻的等待时长，设置 `decision = { retry: true, delay }`。
+- **响应驱动判定（对齐 1.x）**：`http.response` hook 捕获原始响应（状态码 ∈ `statuses`，默认 `[429]`），正文命中 `quotaMatch`（`AccountQuotaExceeded` / `usage quota` / `使用上限` / code 1308）即判定"配额耗尽"；`session.retry` hook 据此计算到配额重置时刻的等待时长并设置 `decision = { retry: true, delay }`。**第一次 429 就接管**（1.x 直接看响应本体；2.0 此前只看 opencode 归纳出的错误文案，会晚一轮）。非配额 429（并发限流等）与其它状态码一律放行，交回 opencode 原生退避——与 1.x 行为一致。
 - 等待时长不封顶（原生 15 分钟 `RETRY_AFTER_MAX` 上限不适用于 hook 设置的 delay，已实测 16 分钟）。
 - 智谱配额 API（`open.bigmodel.cn/api/monitor/usage/quota/limit`）获取精确重置时刻，带 60s 缓存。
 - 429 body 中提取重置时间（`resetExtract` 正则，无时区后缀按 +08:00 解析，与 1.x 一致）。
@@ -54,6 +54,7 @@
     {
       "id": "volces-ark",
       "quota": "body",                       // 匹配方式: body | zhipu
+      "statuses": [429],                     // 可选, 配额入口状态码(默认 [429]; 可加 5xx/其它 4xx)
       "quotaMatch": "AccountQuotaExceeded",  // 可选, 自定义匹配
       "resetExtract": "reset at\\s+((?:\\d{4}-\\d{2}-\\d{2})\\s+\\d{2}:\\d{2}:\\d{2})",
       "fallbackWaitMs": 30000,

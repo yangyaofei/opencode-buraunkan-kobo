@@ -12,7 +12,7 @@
 
 | # | 功能 | V1 实现 | V2 实现 | 对比结论 |
 |---|---|---|---|---|
-| 1 | 配额 429 识别 | `provider.options.fetch` 注入拦截，读响应 body 匹配 `quotaMatch` | `session.http.response` hook 抓 429 body + `session.retry` hook 用同一套正则判定 | **等价**。V2 更干净：不再改写 provider 配置、对宿主零侵入；非配额 429 同样透传走原生退避（语义一致） |
+| 1 | 配额 429 识别 | `provider.options.fetch` 注入拦截，读响应 body 匹配 `quotaMatch` | `session.http.response` hook 抓原始响应（状态码 ∈ `statuses`，默认 `[429]`）+ `session.retry` hook 用同一套正则判定 | **等价（已修复）**。2.0 此前只看 opencode 归纳出的错误文案，首次失败可能晚一轮才判定（真实事故：第一次 429 文案不含配额特征 → 放行 → 第二次才接管）；现改回响应驱动，**第一次即接管**，并新增 `statuses` 可配（1.x 写死 429）。非配额 429 同样透传走原生退避（语义一致） |
 | 2 | 精确等待（配额重置时刻） | 往 429 响应注入 `retry-after-ms` 头交还，骗原生重试机制 | `decision = { retry: true, delay }` 直写重试决策 | **更好**。无 header 欺骗；delay 不封顶（原生 `RETRY_AFTER_MAX` 15 分钟只封 provider 头，hook 值不封，已实测 16 分钟+） |
 | 3 | 智谱配额 API 精确重置 | apiKey 解析链：显式配置 > 本次请求 Authorization 头 > auth.json | 仅显式 `apiKey` | **缺口**：请求头回退可补（`http.request` hook 可见出站头）；auth.json 是 1.x 概念，2.0 等价物待查。见 §4-G1 |
 | 4 | body 提取重置时刻 | `resetExtract` 正则，无时区后缀按 +08:00 | 同（`parseResetAtMs`，一比一移植+单测） | **等价** |
@@ -30,7 +30,7 @@
 
 | V1 字段 | V2 字段 | 说明 |
 |---|---|---|
-| `providers[].id` / `idPattern` / `quota` / `quotaUrl` / `quotaMatch` / `resetExtract` / `fallbackWaitMs` / `bufferMs` / `apiKey` | 同名同义 | 逐项一致，默认值一致（`fallbackWaitMs` 30000、`bufferMs` 10000、`quotaCacheMs` 60000、内置智谱+火山正则） |
+| `providers[].id` / `idPattern` / `quota` / `quotaUrl` / `quotaMatch` / `resetExtract` / `fallbackWaitMs` / `bufferMs` / `apiKey` / `statuses` | 同名同义（`statuses` 为 2.0 新增，默认 `[429]`，1.x 写死 429） | 逐项一致，默认值一致（`fallbackWaitMs` 30000、`bufferMs` 10000、`quotaCacheMs` 60000、内置智谱+火山正则） |
 | `quotaCacheMs` | 同 | 一致 |
 | `patch.enabled/maxRetries/backoffCapMs/restore` | —（无补丁） | N/A：2.0 bytecode 补丁不可行；次数无限由轮次续命承担（等效 `maxRetries: -1`），退避封顶由原生 schedule 承担 |
 | — | `maxRounds`（新增，-1 无限） | 轮次上限。默认 -1 = 无限，等价 V1 `patch.maxRetries: -1` 的行为 |

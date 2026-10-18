@@ -3,6 +3,7 @@ import {
   computeWaitMs,
   expandProviders,
   isQuotaError,
+  isQuotaResponse,
   isQuotaText,
   needsHeartbeat,
   parseResetAtMs,
@@ -61,6 +62,29 @@ describe("isQuotaText / isQuotaError", () => {
     expect(isQuotaError("provider.quota", "whatever")).toBe(true)
     expect(isQuotaError("provider.rate-limit", "AccountQuotaExceeded")).toBe(true)
     expect(isQuotaError("provider.rate-limit", "concurrency limit")).toBe(false)
+  })
+})
+
+describe("isQuotaResponse(响应驱动判定, 对齐 1.x)", () => {
+  test("默认只认 429 + 正文命中配额特征", () => {
+    expect(isQuotaResponse(429, '{"error":{"code":"1308","message":"使用上限"}}')).toBe(true)
+    // 非配额 429(并发限流) → 放行, 交回 opencode 原生退避
+    expect(isQuotaResponse(429, "too many concurrent requests")).toBe(false)
+    // 默认不含其它状态码
+    expect(isQuotaResponse(503, '{"message":"AccountQuotaExceeded"}')).toBe(false)
+  })
+
+  test("statuses 可配(把 5xx/其它状态码纳入配额入口)", () => {
+    const p = { statuses: [429, 503], quotaMatch: "使用上限" }
+    expect(isQuotaResponse(503, "使用上限已用完", p)).toBe(true)
+    expect(isQuotaResponse(429, "使用上限已用完", p)).toBe(true)
+    expect(isQuotaResponse(500, "使用上限已用完", p)).toBe(false)
+  })
+
+  test("状态码缺失/非法 → false", () => {
+    expect(isQuotaResponse(undefined, "使用上限")).toBe(false)
+    expect(isQuotaResponse(null, "使用上限")).toBe(false)
+    expect(isQuotaResponse(Number.NaN, "使用上限")).toBe(false)
   })
 })
 
