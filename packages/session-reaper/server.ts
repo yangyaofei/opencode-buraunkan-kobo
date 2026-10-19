@@ -76,12 +76,26 @@ export default {
   setup: async (ctx: Ctx) => {
     const projectDir = ctx.location?.directory ?? process.cwd()
 
-    const reply = async (sessionID: string, text: string) => {
+    // label: 通知行在界面上的标签(OpenChamber/TUI 只把"带 description 的 synthetic"显示成一行通知)。
+    const reply = async (sessionID: string, text: string, label = "reply") => {
       // 注意: 同一 session 首条之后 runner 可能不再主动消费 inbox(2.0.15 平台行为),
       // 后续回复滞留 /api/session/:id/inbox, 该 session 下次 agent loop 运行时显示
       // —— 见 README "已知限制"
-      await ctx.session.synthetic({ sessionID, text })
+      // id 自指定: 这些回复属于本插件, 在 context hook 里按 id 剥掉, 不进入模型请求。
+      await ctx.session.synthetic({
+        sessionID,
+        id: `msg_session-reaper-reply-${Date.now().toString(36)}` as any,
+        description: `session-reaper · ${label}`,
+        text,
+      })
     }
+
+    // 请求构造期按 id 剥除本插件的命令回复(synthetic 在请求里会变成 user 消息)。
+    await ctx.session.hook("context", async (evt: any) => {
+      if (!Array.isArray(evt?.messages)) return
+      const kept = evt.messages.filter((m: any) => !(typeof m?.id === "string" && m.id.startsWith("msg_session-reaper-")))
+      if (kept.length !== evt.messages.length) evt.messages = kept
+    })
 
     await ctx.command.transform((editor) => {
       editor.add({
@@ -147,7 +161,15 @@ export default {
 
           // ---- status: 桶状态报告(零模型) ----
           if (parsed.action === "status") {
-            await reply(sessionID, statusReport(cfg, loadRegistry(registryFile), registryFile))
+            {
+              const reg = loadRegistry(registryFile)
+              const pipelines = new Set([...Object.keys(reg), ...Object.keys(cfg.pipelines ?? {})]).size
+              await reply(
+                sessionID,
+                statusReport(cfg, reg, registryFile),
+                `status (${pipelines} pipelines)`,
+              )
+            }
             return
           }
 
@@ -200,6 +222,7 @@ export default {
               await reply(
                 sessionID,
                 `[session-reaper] ${name} 配置已更新: keepDays=${cfg.pipelines[name].keepDays ?? "(未设)"} maxSessions=${cfg.pipelines[name].maxSessions ?? "(未设)"}`,
+                `set ${name}` + (parsed.keepDays === undefined && parsed.maxSessions === undefined ? " (view)" : ""),
               )
               return
             }
@@ -208,6 +231,7 @@ export default {
             await reply(
               sessionID,
               `[session-reaper] ${name}: keepDays=${rule.keepDays ?? "不清理"} maxSessions=${rule.maxSessions ?? "不限"} (${rule.explicit ? "显式配置" : "default 兜底"})\n改变行为: /session-reaper set --pipeline ${name} --keep-days N --max-sessions M`,
+              `set ${name} (view)`,
             )
             return
           }
@@ -238,7 +262,7 @@ export default {
             ]
             for (const e of reaped) lines.push(`  已删除 ${e.id} (${ageText(e.created, Date.now())})`)
             for (const e of failed) lines.push(`  删除失败(保留重试) ${e.id}`)
-            await reply(sessionID, lines.join("\n"))
+            await reply(sessionID, lines.join("\n"), `reap ${parsed.pipeline}: 删除 ${reaped.length}, 失败 ${failed.length}, 存活 ${survivors.length}`)
             return
           }
         },

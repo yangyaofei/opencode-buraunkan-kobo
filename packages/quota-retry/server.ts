@@ -32,7 +32,7 @@
 //   ✅ 无限次数(轮次续命, 每轮原生 10 次; 1.x 靠二进制补丁, 2.0 出货二进制核心
 //      chunk 是 JSC bytecode, 明文补丁无效 — 已实验证明)
 //   ✅ TUI 可见性(原生徽标 + 每轮覆写的通知行 "quota-retry · 第 N 轮")
-//   ✅ quota_retry_status 工具 / retry-setting 命令(零模型回复)
+//   ✅ quota-retry-status 工具 / retry-setting 命令(零模型回复)
 //   ✅ 长等待心跳(插件自己的定时 fiber, 框架原语, 不依赖宿主事件)
 //   ❌ on-demand 降级链: 已移除(2.0 无模型路由能力; 见 issue #2)
 
@@ -46,14 +46,14 @@ import {
   needsHeartbeat,
   parseResetAtMs,
   shouldContinue,
-  stripMarkerUsers,
   zhipuResetAtMs,
   DEFAULT_QUOTA_CACHE_MS,
   DEFAULT_HEARTBEAT_MS,
   DEFAULT_QUOTA_STATUSES,
   HEARTBEAT_TEXT_PREFIX,
   MARKER_TEXT_PREFIX,
-  MARKER_TEXT_PREFIXES,
+  MESSAGE_ID_PREFIX,
+  isPluginMessageId,
   type PluginConfig,
   type ProviderConfig,
 } from "./core"
@@ -146,9 +146,9 @@ export default Plugin.define({
       return ctx.session
         .synthetic({
           sessionID: sid as any,
-          id: `msg_${MARKER_PREFIX}-heartbeat-${now.toString(36)}-${Math.random().toString(36).slice(2, 8)}` as any,
+          id: `${MESSAGE_ID_PREFIX}-heartbeat-${now.toString(36)}` as any,
           text: `${HEARTBEAT_TEXT_PREFIX}${Math.random().toString(36).slice(2, 10)}`,
-          description: `${MARKER_PREFIX} heartbeat · 内部标记(不发给模型)`,
+          description: `${MARKER_PREFIX} heartbeat`,
           resume: false,
         })
         .pipe(Effect.asVoid)
@@ -212,27 +212,31 @@ export default Plugin.define({
         const auth = req.headers.get("authorization")
         if (auth) authCache.set(providerID, auth.replace(/^Bearer\s+/i, ""))
       }
-      if (req.method === "POST") {
-        const body: any = await req.clone().json().catch(() => null)
-        if (body && Array.isArray(body.messages) && body.messages.length > 0) {
-          const stripped = stripMarkerUsers(body.messages, MARKER_TEXT_PREFIXES)
-          if (stripped) {
-            const headers = new Headers(req.headers)
-            headers.delete("content-length")
-            evt.request = new Request(req, {
-              method: "POST",
-              headers,
-              body: JSON.stringify({ ...body, messages: stripped }),
-            })
-          }
-        }
-      }
     }
     yield* ctx.session.hook("http.request", (evt) =>
       runAsync(
         () => onHttpRequest(evt),
         (err) => dbg("[strip] error:", String(err)),
       ),
+    )
+
+    // ── 部件 0: 请求构造期按 id 剥除本插件自建的消息(标记/回复) ──
+    // synthetic 在请求里会变成 user 消息; 在 context hook(HTTP 序列化之前)按 id 前缀整段丢掉,
+    // 模型永远看不到轮次标记/心跳/retry-setting 回复。旧实现的 id 同前缀, 一并覆盖。
+    yield* ctx.session.hook("context", (evt: any) =>
+      Effect.sync(() => {
+        try {
+          if (!Array.isArray(evt?.messages)) return
+          const kept = evt.messages.filter((m: any) => !isPluginMessageId(m?.id))
+          const removed = evt.messages.length - kept.length
+          if (removed > 0) {
+            evt.messages = kept
+            dbg("[context] stripped:", removed)
+          }
+        } catch (err) {
+          dbg("[context] ERROR:", String(err))
+        }
+      }),
     )
 
     // ── 部件 1a 前置: 续命期间压制 title 重生成(标记驱动的新执行会触发它, 浪费一次请求) ──
@@ -323,7 +327,7 @@ export default Plugin.define({
       Effect.gen(function* () {
         // 标记 text = 前缀 + 随机 token: 出口按前缀精确剥掉(不靠"空"判定),
         // description 前台可见, id 自指定便于定位。
-        const markerID = `msg_${MARKER_PREFIX}_r${round}_${Date.now().toString(36)}`
+        const markerID = `${MESSAGE_ID_PREFIX}-round-${round}-${Date.now().toString(36)}`
         const markerText = `${MARKER_TEXT_PREFIX}${Math.random().toString(36).slice(2, 10)}`
         yield* ctx.session
           .synthetic({
@@ -444,7 +448,7 @@ export default Plugin.define({
 
     yield* ctx.tool.transform((editor) => {
       editor.add({
-        name: "quota_retry_status",
+        name: "quota-retry-status",
         description: "读取 quota-retry 配置与匹配到的 provider(只读, 无副作用)。",
         input: Schema.Struct({}),
         execute: () =>
@@ -465,7 +469,12 @@ export default Plugin.define({
             const sessionID = String(input?.sessionID ?? "")
             if (!sessionID) return
             yield* ctx.session
-              .synthetic({ sessionID: sessionID as any, text: statusReport(sessionID) })
+              .synthetic({
+                sessionID: sessionID as any,
+                id: `${MESSAGE_ID_PREFIX}-status-${Date.now().toString(36)}` as any,
+                description: `quota-retry · status (${[...expanded.keys()].length} providers)`,
+                text: statusReport(sessionID),
+              })
               .pipe(Effect.asVoid, Effect.catch(() => Effect.void))
           }),
       })

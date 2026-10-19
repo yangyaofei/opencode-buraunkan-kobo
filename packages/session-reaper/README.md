@@ -33,6 +33,11 @@ registry 落 `~/.local/state/opencode/session-reaper/registry.json`（XDG_STATE_
 - **环境注入**：1.x 通过 `shell.env` hook 注入 `OPENCODE_SESSION_ID`；2.0 的 shell hook 无 sessionID 维度，已放弃（辅助功能）。
 - **零模型回复**：1.x 用 `noReply` + ignored parts + 哨兵异常 hack；2.0 用官方 `ctx.session.synthetic`。
 
+
+## 命令回复不进入模型请求
+
+命令回复用 `session.synthetic` 写入会话（前台可见），`id` 自指定为 `msg_session-reaper-reply-<ts>`，并带 `description`（`session-reaper · <action>`）供界面显示成一行通知；插件在 `context` hook（HTTP 序列化之前）按该 id 前缀剔除，因此这些回复不会进入模型请求。
+
 ## 已知限制（2.0.15 平台行为）
 
 同一 session 中，首条 synthetic 之后 runner 可能不再主动消费 inbox——后续命令回复滞留在 `/api/session/:id/inbox`，该 session 下次 agent loop 运行（如下一条用户消息）时才显示。回复不会丢失，仅显示延迟。
