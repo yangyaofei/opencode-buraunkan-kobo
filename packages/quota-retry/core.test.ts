@@ -14,6 +14,8 @@ import {
   xdgDataDir,
   zhipuResetAtMs,
   DEFAULT_HEARTBEAT_MS,
+  HEARTBEAT_TEXT_PREFIX,
+  MARKER_TEXT_PREFIX,
 } from "./core"
 
 describe("expandProviders", () => {
@@ -175,33 +177,36 @@ describe("端到端(body 场景)", () => {
   })
 })
 
-describe("stripMarkerUsers(出口净化: 任意位置、按前缀)", () => {
-  test("剥掉任意位置的标记 user(字符串形态)", () => {
+describe("stripMarkerUsers(出口净化: 任意位置、前缀+随机 token 形状)", () => {
+  const roundText = (token = "rd7f3a01") => `${MARKER_TEXT_PREFIX}${token}`
+  const hbText = (token = "hb5c9e02") => `${HEARTBEAT_TEXT_PREFIX}${token}`
+
+  test("剥掉任意位置的标记 user(字符串与 parts 形态)", () => {
     const msgs = [
       { role: "user", content: "hi" },
       { role: "assistant", content: "done" },
-      { role: "user", content: "quota-retry-round-ab12cd34" },
+      { role: "user", content: roundText() },
+      { role: "user", content: [{ type: "text", text: hbText() }] },
     ]
     const out = stripMarkerUsers(msgs)!
     expect(out.length).toBe(2)
-    expect((out[1] as any).role).toBe("assistant")
+    expect(out.map((m: any) => m.content)).toEqual(["hi", "done"])
   })
 
   test("中间的标记也要剥(标记后面还有真实内容: 心跳标记的典型场景)", () => {
     const msgs = [
       { role: "user", content: "hi" },
-      { role: "assistant", content: "attempt failed" },
-      { role: "user", content: "quota-retry-heartbeat-x1" }, // 等待期间的心跳标记
-      { role: "assistant", content: "resumed and wrote real content" }, // 等待结束后模型继续
+      { role: "user", content: hbText() },
+      { role: "assistant", content: "resumed and wrote real content" },
       { role: "user", content: "next turn" },
     ]
     const out = stripMarkerUsers(msgs)!
-    expect(out.length).toBe(4)
-    expect(out.map((m: any) => m.content)).toEqual(["hi", "attempt failed", "resumed and wrote real content", "next turn"])
+    expect(out.map((m: any) => m.content)).toEqual(["hi", "resumed and wrote real content", "next turn"])
   })
 
   test("多轮累积: 两轮各 10 条标记 + 真实内容 → 标记全剥、内容全留", () => {
-    const round = (n: number) => Array.from({ length: 10 }, (_, i) => ({ role: "user", content: `quota-retry-round-r${n}-${i}` }))
+    const round = (n: number) =>
+      Array.from({ length: 10 }, (_, i) => ({ role: "user", content: roundText(`r${n}tok${i}abc`) }))
     const msgs = [
       { role: "user", content: "hi" },
       ...round(1),
@@ -209,19 +214,27 @@ describe("stripMarkerUsers(出口净化: 任意位置、按前缀)", () => {
       ...round(2),
       { role: "assistant", content: "content after round 2" },
     ]
-    const out = stripMarkerUsers(msgs)!
-    expect(out.length).toBe(3)
-    expect(out.map((m: any) => m.content)).toEqual(["hi", "content after round 1", "content after round 2"])
+    expect(stripMarkerUsers(msgs)!.map((m: any) => m.content)).toEqual([
+      "hi",
+      "content after round 1",
+      "content after round 2",
+    ])
   })
 
-  test("两个前缀都认(round + heartbeat), 含 parts 形态", () => {
-    const msgs = [
-      { role: "user", content: "hi" },
-      { role: "user", content: [{ type: "text", text: "quota-retry-round-x1" }] },
-      { role: "user", content: "quota-retry-heartbeat-x2" },
-      { role: "user", content: [{ type: "text", text: "quota-retry-heartbeat-x3" }] },
+  test("真实用户消息只是以标记前缀开头(带后续文字) → 不误删", () => {
+    expect(stripMarkerUsers([{ role: "user", content: `${MARKER_TEXT_PREFIX}rd7f3a01 是什么？` }])).toBeNull()
+    expect(stripMarkerUsers([{ role: "user", content: `${HEARTBEAT_TEXT_PREFIX} 什么意思` }])).toBeNull()
+    // 纯随机 token 但太短(不像我们的 token)也不剥
+    expect(stripMarkerUsers([{ role: "user", content: `${MARKER_TEXT_PREFIX}abc` }])).toBeNull()
+  })
+
+  test("兼容旧前缀(已部署版本发出过的标记)", () => {
+    const legacy = [
+      { role: "user", content: "quota-retry-round-ab12cd34" },
+      { role: "user", content: "quota-retry-round--hb-ab12cd34" },
+      { role: "user", content: "quota-retry-heartbeat-ab12cd34" },
     ]
-    expect(stripMarkerUsers(msgs)!.length).toBe(1)
+    expect(stripMarkerUsers([{ role: "user", content: "hi" }, ...legacy])!.length).toBe(1)
   })
 
   test("空 user 不再被剥(空可能是用户真的发了空串)", () => {
@@ -231,20 +244,21 @@ describe("stripMarkerUsers(出口净化: 任意位置、按前缀)", () => {
 
   test("不误伤: 普通消息/assistant/带前缀但不匹配的 parts 返回 null", () => {
     expect(stripMarkerUsers([{ role: "user", content: "hi" }])).toBeNull()
-    expect(stripMarkerUsers([{ role: "assistant", content: "quota-retry-round-x" }])).toBeNull()
+    expect(stripMarkerUsers([{ role: "assistant", content: roundText() }])).toBeNull()
     expect(stripMarkerUsers([{ role: "user", content: [{ type: "text", text: "hi" }] }])).toBeNull()
     // parts 里混有普通文本 → 不算标记
     expect(
       stripMarkerUsers([
-        { role: "user", content: [{ type: "text", text: "quota-retry-round-x" }, { type: "text", text: "hi" }] },
+        { role: "user", content: [{ type: "text", text: roundText() }, { type: "text", text: "hi" }] },
       ]),
     ).toBeNull()
   })
 
-  test("自定义前缀生效", () => {
-    expect(stripMarkerUsers([{ role: "user", content: "xyz-1" }], "xyz-")!.length).toBe(0)
-    expect(stripMarkerUsers([{ role: "user", content: "xyz-1" }], "abc-")).toBeNull()
-    expect(stripMarkerUsers([{ role: "user", content: "xyz-1" }], ["abc-", "xyz-"])!.length).toBe(0)
+  test("自定义前缀生效(仍需前缀+随机 token 形状)", () => {
+    expect(stripMarkerUsers([{ role: "user", content: "xyz-abcdef" }], "xyz-")!.length).toBe(0)
+    expect(stripMarkerUsers([{ role: "user", content: "xyz-abcdef" }], "abc-")).toBeNull()
+    expect(stripMarkerUsers([{ role: "user", content: "xyz-abcdef" }], ["abc-", "xyz-"])!.length).toBe(0)
+    expect(stripMarkerUsers([{ role: "user", content: "xyz-1" }], "xyz-")).toBeNull()
   })
 })
 

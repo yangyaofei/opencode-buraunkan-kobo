@@ -22,9 +22,9 @@
 - 等待时长不封顶（原生 15 分钟 `RETRY_AFTER_MAX` 上限不适用于 hook 设置的 delay，已实测 16 分钟）。
 - 智谱配额 API（`open.bigmodel.cn/api/monitor/usage/quota/limit`）获取精确重置时刻，带 60s 缓存。
 - 429 body 中提取重置时间（`resetExtract` 正则，无时区后缀按 +08:00 解析，与 1.x 一致）。
-- **轮次续命（无限次数）**：原生 10 次耗尽后，从事件流捕获 `execution.failed`，注入一条 synthetic 通知行驱动新执行（= 全新 10 次原生重试，无限轮）。标记的 `text = "quota-retry-round-" + 随机 token`（出口按前缀精确剥除），`description = "quota-retry · 第 N 轮"` 前台可见，消息 `id` 由插件自指定（`msg_quota-retry_rN_xxx`）。不删失败现场——revert 无插件 API，已提上游 issue。
+- **轮次续命（无限次数）**：原生 10 次耗尽后，从事件流捕获 `execution.failed`，注入一条 synthetic 通知行驱动新执行（= 全新 10 次原生重试，无限轮）。标记的 `text = "EL-PSY-CONGROO-quota-retry-round-" + 随机 token`（出口按"前缀 + 随机 token"形状精确剥除），`description = "quota-retry round · 第 N 轮"` 前台可见（长前缀不出现在界面），消息 `id` 由插件自指定（`msg_quota-retry_rN_xxx`）。不删失败现场——revert 无插件 API，已提上游 issue。
 - **续命触发可配置**（`continueOn`）：默认对齐 1.x `maxRetries=-1` 的语义——opencode 原生会重试的那一类错误（`provider.quota` / `provider.rate-limit` / `provider.internal` / `provider.transport` / `provider.invalid-output` / `provider.unknown`）以及 429 + 全部 5xx；`denyTypes`（默认 auth / content-filter / invalid-request / unsupported-operation / no-route）一票否决；可用 `types` / `statuses` / `match` 正则覆盖默认（例如让某些 400 也续命）。
-- **出口净化**：`http.request` hook 剥掉"标记"映射出的 user 消息——**按标记文本前缀判定（任意位置都剥），不按"空"判定**（空 user 可能是用户真的发了空串）。轮次标记前缀 `quota-retry-round-`，心跳标记前缀 `quota-retry-heartbeat-`。第 2+ 轮请求与原始 turn 字节级一致（Docker 实测 45 次 429 全程同 hash、无残留标记消息）；标记后面出现真实内容（等待结束模型继续）时同样被剥掉，不会进入模型请求。
+- **出口净化**：`http.request` hook 剥掉"标记"映射出的 user 消息——**按标记文本判定（任意位置都剥），不按"空"判定**（空 user 可能是用户真的发了空串）。标记的完整形状 = 前缀 + 纯随机 token（小写字母/数字，≥6 位），只剥完整形状，用户消息哪怕以同样前缀开头、后面还有文字也不会被误删。轮次前缀 `EL-PSY-CONGROO-quota-retry-round-`，心跳前缀 `EL-PSY-CONGROO-quota-retry-heartbeat-`；已部署版本发过的旧前缀（`quota-retry-round-` / `quota-retry-heartbeat-`）继续兼容。第 2+ 轮请求与原始 turn 字节级一致（Docker 实测 45 次 429 全程同 hash、无残留标记消息）；标记后面出现真实内容（等待结束模型继续）时同样被剥掉，不会进入模型请求。
 - **运行日志（默认关闭，排查时开）**：配置 `logFile: true` 打开（默认路径 `~/.cache/opencode/buraunkan/quota-retry.log`，512KB 上限自动截断），或给自定义路径；缺省 / `false` = 关闭。只记关键决策：判定命中与算出的等待、心跳发送/失败、加载/卸载与错误 —— 用于事后定位"等待为什么没撑住"这类问题。
 - 用户接管：续命过程中用户发新消息自动停止续命让位。
 - `quota_retry_status` 工具 + `/retry-setting` 命令（`ctx.session.synthetic` 零模型回复）。
@@ -78,7 +78,7 @@
 
 - `continueOn.types` / `statuses` / `match` 任一命中即续命；`denyTypes` 优先（默认含 auth/content-filter/invalid-request/unsupported-operation/no-route）。要在默认 deny 的类型上续命，需显式把它从 `denyTypes` 移除（如 `"denyTypes": []`）。
 - `continueOn.statuses` 缺省 = 429 与全部 5xx。
-- `heartbeatMs`（默认 2700000 = 45 分钟）：**长等待心跳**。opencode 的 location 不活动回收在 60 分钟内没有 durable 会话事件时会以 `reason: "inactivity"` 打断正在等待的执行（`packages/core/src/location-activity.ts`：TTL 写死 60 分钟、只被"带 location 的 durable 会话事件"刷新、无配置口），而"等待配额重置"期间不产生任何事件，所以超过 60 分钟的等待会被掐断（实测：等待开始后 61 分钟 `location services evicted` + `outcome=interrupted`）。心跳 = 等待期间每 45 分钟落一条 durable 标记（`session.synthetic`，`resume: false` → 只入队不唤醒，**不打断睡眠**），让 TTL 持续被刷新；标记文本用独立前缀 `quota-retry-heartbeat-`，与轮次标记一样在出口按前缀剥除（任意位置），**不进入模型请求**。等待本身仍是一次到重置点（不切段）。代价：每次心跳在会话里多一条标记行。设 `0` 关闭。
+- `heartbeatMs`（默认 2700000 = 45 分钟）：**长等待心跳**。opencode 的 location 不活动回收在 60 分钟内没有 durable 会话事件时会以 `reason: "inactivity"` 打断正在等待的执行（`packages/core/src/location-activity.ts`：TTL 写死 60 分钟、只被"带 location 的 durable 会话事件"刷新、无配置口），而"等待配额重置"期间不产生任何事件，所以超过 60 分钟的等待会被掐断（实测：等待开始后 61 分钟 `location services evicted` + `outcome=interrupted`）。心跳 = 等待期间每 45 分钟落一条 durable 标记（`session.synthetic`，`resume: false` → 只入队不唤醒，**不打断睡眠**），让 TTL 持续被刷新；标记文本用独立前缀 `EL-PSY-CONGROO-quota-retry-heartbeat-`（与轮次标记一样按"前缀 + 随机 token"形状在出口剥除，任意位置），**不进入模型请求**；界面只显示 `quota-retry heartbeat · 内部标记(不发给模型)` 这行标签，长前缀不出现在界面。等待本身仍是一次到重置点（不切段）。代价：每次心跳在会话里多一条标记行。设 `0` 关闭。
   - **实现方式（effect 形态的原因）**：心跳是**插件自己的定时 fiber**——每个长等待 `Effect.forkScoped` 一个 `Effect.sleep` 循环，等待结束（`step.started` / `interrupted` / `succeeded` / `execution.failed`）即中断，插件卸载时随 Scope 自动清理。定时能力来自 opencode 宿主提供的 Effect 运行时（与内置插件 `provider/digitalocean.ts` 的周期循环同一原语），**不依赖任何宿主周期事件**。
 
 ## 安装

@@ -182,11 +182,21 @@ export async function zhipuResetAtMs(
 // 轮次标记的文本前缀。标记的 text = 前缀 + 随机 token: 既让出站过滤能精确识别
 // "这必然是我们注入的"(不靠"空字符串"这种可能撞上真实用户输入的判据), 也让它在
 // session DB / 日志里一眼可辨。
-export const MARKER_TEXT_PREFIX = "quota-retry-round-"
+export const MARKER_TEXT_PREFIX = "EL-PSY-CONGROO-quota-retry-round-"
 // 心跳标记的前缀(与轮次标记分开命名, 语义各归各的)
-export const HEARTBEAT_TEXT_PREFIX = "quota-retry-heartbeat-"
-// 出口净化认识的全部标记前缀(任意位置、按前缀整段剥除)
-export const MARKER_TEXT_PREFIXES = [MARKER_TEXT_PREFIX, HEARTBEAT_TEXT_PREFIX] as const
+export const HEARTBEAT_TEXT_PREFIX = "EL-PSY-CONGROO-quota-retry-heartbeat-"
+// 历史前缀: 已部署版本发出过的标记, 出口继续认(升级后旧会话里的标记也剥得掉)
+export const LEGACY_MARKER_TEXT_PREFIXES = [
+  "quota-retry-round-", // 旧轮次前缀(含更早的心跳形如 quota-retry-round--hb-*)
+  "quota-retry-round--hb-",
+  "quota-retry-heartbeat-", // a7710e7 起的旧心跳前缀
+] as const
+// 出口净化认识的全部标记前缀(任意位置; 只认"前缀 + 随机 token"的完整形状)
+export const MARKER_TEXT_PREFIXES = [
+  MARKER_TEXT_PREFIX,
+  HEARTBEAT_TEXT_PREFIX,
+  ...LEGACY_MARKER_TEXT_PREFIXES,
+] as const
 
 // 续命默认可续的错误类型 = opencode 原生 isRetryable 的那一组
 // (RateLimit/ProviderInternal/Transport/InvalidProviderOutput/UnknownProvider + 插件翻转的 Quota)
@@ -240,8 +250,13 @@ export function isMarkerText(
   prefixes: string | readonly string[] = MARKER_TEXT_PREFIXES,
 ): boolean {
   const list = typeof prefixes === "string" ? [prefixes] : prefixes
+  // 标记的完整形状 = 前缀 + 纯随机 token(小写字母/数字)。带任何后续文字的真实用户消息不匹配。
   const matches = (text: unknown) =>
-    typeof text === "string" && list.some((prefix) => text.startsWith(prefix))
+    typeof text === "string" &&
+    list.some(
+      (prefix) =>
+        text.startsWith(prefix) && /^[a-z0-9]{6,}$/.test(text.slice(prefix.length)),
+    )
   if (typeof content === "string") return matches(content)
   if (Array.isArray(content)) {
     const texts = content.filter(

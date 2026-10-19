@@ -146,9 +146,9 @@ export default Plugin.define({
       return ctx.session
         .synthetic({
           sessionID: sid as any,
-          id: `msg_${HEARTBEAT_TEXT_PREFIX}${now.toString(36)}-${Math.random().toString(36).slice(2, 8)}` as any,
+          id: `msg_${MARKER_PREFIX}-heartbeat-${now.toString(36)}-${Math.random().toString(36).slice(2, 8)}` as any,
           text: `${HEARTBEAT_TEXT_PREFIX}${Math.random().toString(36).slice(2, 10)}`,
-          description: `${MARKER_TEXT_PREFIX} · 等待心跳 · 内部标记(不发给模型)`,
+          description: `${MARKER_PREFIX} heartbeat · 内部标记(不发给模型)`,
           resume: false,
         })
         .pipe(Effect.asVoid)
@@ -330,7 +330,7 @@ export default Plugin.define({
             sessionID: sessionID as any,
             id: markerID as any,
             text: markerText,
-            description: `${MARKER_PREFIX} · 第 ${round} 轮`,
+            description: `${MARKER_PREFIX} round · 第 ${round} 轮`,
           })
           .pipe(
             Effect.tap(() =>
