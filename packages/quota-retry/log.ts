@@ -1,6 +1,6 @@
-// quota-retry 运行日志: 默认常开, 固定路径 + 容量上限。
-// 用途: 出事(例如"第一次失败没被识别为配额")时能直接看到每个 hook 收到了什么、
-// 判定结果与算出的等待 —— 不必再依赖现场是否还在。
+// quota-retry 运行日志(默认关闭, 排查时开): 固定路径 + 容量上限。
+// 用途: 出事时能直接看到关键决策(判定命中/算出的等待/心跳发送与失败/加载卸载/错误)——
+// 不必再依赖现场是否还在。
 import { appendFileSync, mkdirSync, statSync, truncateSync } from "node:fs"
 import os from "node:os"
 import path from "node:path"

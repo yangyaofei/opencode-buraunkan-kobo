@@ -25,7 +25,7 @@
 - **轮次续命（无限次数）**：原生 10 次耗尽后，从事件流捕获 `execution.failed`，注入一条 synthetic 通知行驱动新执行（= 全新 10 次原生重试，无限轮）。标记的 `text = "quota-retry-round-" + 随机 token`（出口按前缀精确剥除），`description = "quota-retry · 第 N 轮"` 前台可见，消息 `id` 由插件自指定（`msg_quota-retry_rN_xxx`）。不删失败现场——revert 无插件 API，已提上游 issue。
 - **续命触发可配置**（`continueOn`）：默认对齐 1.x `maxRetries=-1` 的语义——opencode 原生会重试的那一类错误（`provider.quota` / `provider.rate-limit` / `provider.internal` / `provider.transport` / `provider.invalid-output` / `provider.unknown`）以及 429 + 全部 5xx；`denyTypes`（默认 auth / content-filter / invalid-request / unsupported-operation / no-route）一票否决；可用 `types` / `statuses` / `match` 正则覆盖默认（例如让某些 400 也续命）。
 - **出口净化**：`http.request` hook 剥掉尾部"轮次标记"映射出的 user 消息——**按标记文本前缀判定，不按"空"判定**（空 user 可能是用户真的发了空串）。第 2+ 轮请求与原始 turn 字节级一致（Docker 实测 45 次 429 全程同 hash、无残留标记消息）。
-- **运行日志（默认常开）**：`~/.cache/opencode/buraunkan/quota-retry.log`（512KB 上限自动截断；配置 `logFile` 可改路径或 `false` 关闭）。记录每个响应状态、捕获到的配额响应正文、`retry` hook 收到的错误（类型/状态码/文案）、判定结果（engage / pass 及原因）、算出的等待、心跳发送 —— 用于事后定位"第一次失败为什么没被识别为配额"这类问题。
+- **运行日志（默认关闭，排查时开）**：配置 `logFile: true` 打开（默认路径 `~/.cache/opencode/buraunkan/quota-retry.log`，512KB 上限自动截断），或给自定义路径；缺省 / `false` = 关闭。只记关键决策：判定命中与算出的等待、心跳发送/失败、加载/卸载与错误 —— 用于事后定位"等待为什么没撑住"这类问题。
 - 用户接管：续命过程中用户发新消息自动停止续命让位。
 - `quota_retry_status` 工具 + `/retry-setting` 命令（`ctx.session.synthetic` 零模型回复）。
 
@@ -63,7 +63,7 @@
     }
   ],
   "quotaCacheMs": 60000,
-  "logFile": "~/.cache/opencode/buraunkan/quota-retry.log",  // 可选; 缺省即此路径, false = 关闭
+  "logFile": true,            // 可选; 默认关闭。true = 默认路径, 字符串 = 自定义路径
   "maxRounds": -1,
   "heartbeatMs": 2700000,     // 长等待心跳间隔(默认 45 分钟; 0 = 关闭)
   // 续命触发策略(可选; 缺省 = 可重试类型 + 429/5xx)
@@ -78,7 +78,7 @@
 
 - `continueOn.types` / `statuses` / `match` 任一命中即续命；`denyTypes` 优先（默认含 auth/content-filter/invalid-request/unsupported-operation/no-route）。要在默认 deny 的类型上续命，需显式把它从 `denyTypes` 移除（如 `"denyTypes": []`）。
 - `continueOn.statuses` 缺省 = 429 与全部 5xx。
-- `heartbeatMs`（默认 2700000 = 45 分钟）：**长等待心跳**。opencode 的 location 不活动回收在 60 分钟内没有 durable 会话事件时会以 `reason: "inactivity"` 打断正在等待的执行（`packages/core/src/location-activity.ts`：TTL 写死 60 分钟、只被"带 location 的 durable 会话事件"刷新、无配置口），而"等待配额重置"期间不产生任何事件，所以超过 60 分钟的等待会被掐断（实测：等待开始后 61 分钟 `location services evicted` + `outcome=interrupted`）。心跳 = 等待期间每 45 分钟落一条 durable 标记（`session.synthetic`，`resume: false` → 只入队不唤醒，**不打断睡眠**），让 TTL 持续被刷新；标记文本用同一前缀，出口会被剥掉，**不进入模型请求**。等待本身仍是一次到重置点（不切段）。代价：每次心跳在会话里多一条标记行。设 `0` 关闭。
+- `heartbeatMs`（默认 2700000 = 45 分钟）：**长等待心跳**。opencode 的 location 不活动回收在 60 分钟内没有 durable 会话事件时会以 `reason: "inactivity"` 打断正在等待的执行（`packages/core/src/location-activity.ts`：TTL 写死 60 分钟、只被"带 location 的 durable 会话事件"刷新、无配置口），而"等待配额重置"期间不产生任何事件，所以超过 60 分钟的等待会被掐断（实测：等待开始后 61 分钟 `location services evicted` + `outcome=interrupted`）。心跳 = 等待期间落 durable 标记（`session.synthetic`，`resume: false` → 只入队不唤醒，**不打断睡眠**；发送时机由宿主事件驱动——插件只做被调用时能做的事，每次收到事件时检查是否到期，间隔默认 45 分钟），让 TTL 持续被刷新；标记文本用同一前缀，出口会被剥掉，**不进入模型请求**。等待本身仍是一次到重置点（不切段）。代价：每次心跳在会话里多一条标记行。设 `0` 关闭。
 
 ## 安装
 

@@ -39,10 +39,11 @@ export type ContinuePolicy = {
 export type PluginConfig = {
   providers?: ProviderConfig[]
   quotaCacheMs?: number
-  // 运行日志文件。缺省 = ~/.cache/opencode/buraunkan/quota-retry.log(常开, 512KB 上限自动截断);
-  // 传字符串 = 自定义路径; 传 false = 关闭。日志记录每个 hook 收到的内容、判定结果与等待,
-  // 用于事后定位("第一次失败为什么没被识别为配额"这类问题)。
-  logFile?: string | false
+  // 运行日志文件(默认关闭, 只在排查时开)。true = 默认路径
+  // ~/.cache/opencode/buraunkan/quota-retry.log; 传字符串 = 自定义路径; false/缺省 = 关闭。
+  // 512KB 上限自动截断。只记关键决策: 判定命中与算出的等待、心跳发送/失败、加载/卸载与错误,
+  // 用于事后定位"等待为什么没撑住"这类问题。
+  logFile?: string | boolean
   // 轮次续命的轮数上限; -1 = 不限(默认)。每轮 = 原生 10 次重试。
   maxRounds?: number
   // 续命触发策略(默认: 可重试错误类型 + 429/5xx)。
@@ -50,8 +51,9 @@ export type PluginConfig = {
   // 长等待心跳间隔(ms)。opencode 的 location 不活动回收在 60 分钟无 durable 会话事件时以
   // reason="inactivity" 打断正在等待的执行(core/src/location-activity.ts, TTL 写死、只被
   // "带 location 的 durable 会话事件"刷新)。等待配额重置期间不产生事件, 所以超过 60 分钟的
-  // 等待会被掐断。心跳 = 等待期间定期落一条 durable 标记(session.synthetic, resume:false,
-  // 不唤醒执行), 让 TTL 持续被刷新。默认 45 分钟(留余量); 0 = 关闭心跳。
+  // 等待会被掐断。心跳 = 等待期间落一条 durable 标记(session.synthetic, resume:false,
+  // 不唤醒执行), 让 TTL 持续被刷新; 发送时机由宿主事件驱动(插件只做被调用时能做的事),
+  // 每次收到事件时检查到期。默认 45 分钟(留余量); 0 = 关闭心跳。
   heartbeatMs?: number
 }
 
@@ -112,6 +114,15 @@ export function isQuotaResponse(
   if (!Number.isFinite(s)) return false
   if (!(p?.statuses ?? DEFAULT_QUOTA_STATUSES).includes(s)) return false
   return isQuotaText(text, p?.quotaMatch)
+}
+
+// 心跳到期检查(纯函数): 返回已经到期的 sessionID 列表。
+// 心跳由**宿主事件驱动**发送(插件是被调用者: hook/事件回调都是宿主来调, 不建自建定时器),
+// 每次被调用时用它算"有没有该发的", 到期就落一条 durable 标记刷新 location 的 60 分钟 TTL。
+export function dueHeartbeats(map: ReadonlyMap<string, number>, now: number): string[] {
+  const due: string[] = []
+  for (const [sid, at] of map) if (now >= at) due.push(sid)
+  return due
 }
 
 // 从 429 body 提取重置时刻(捕获组 1 = 完整时间串); 无时区后缀按 +08:00 解析。
