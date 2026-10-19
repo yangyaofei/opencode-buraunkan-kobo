@@ -33,6 +33,8 @@
 //      chunk 是 JSC bytecode, 明文补丁无效 — 已实验证明)
 //   ✅ TUI 可见性(原生徽标 + 每轮覆写的通知行 "quota-retry · 第 N 轮")
 //   ✅ quota-retry-status 工具 / retry-setting 命令(零模型回复)
+//   消息可见性(全部本插件自建消息): id = msg_quota-retry-*, resume 只决定是否唤醒,
+//   是否进模型请求由 context hook 按 id 剥除决定(详见 README 的"消息总表")
 //   ✅ 长等待心跳(插件自己的定时 fiber, 框架原语, 不依赖宿主事件)
 //   ❌ on-demand 降级链: 已移除(2.0 无模型路由能力; 见 issue #2)
 
@@ -149,6 +151,7 @@ export default Plugin.define({
           id: `${MESSAGE_ID_PREFIX}-heartbeat-${now.toString(36)}` as any,
           text: `${HEARTBEAT_TEXT_PREFIX}${Math.random().toString(36).slice(2, 10)}`,
           description: `${MARKER_PREFIX} heartbeat`,
+          // 只刷 location TTL: 不唤醒(不打断正在进行的等待), 也不进模型请求(context hook 按 id 剥)
           resume: false,
         })
         .pipe(Effect.asVoid)
@@ -203,8 +206,8 @@ export default Plugin.define({
         yield* disarmHeartbeat(sid, "succeeded")
       })
 
-    // ── 部件 3: 出口净化 — 剥掉尾部"轮次标记"映射出的 user 消息 ──
-    // 只认标记文本前缀(前缀+随机 token), 不按"空"判定: 空 user 可能是用户真的发了 ""。
+    // ── 部件 3: 记录出站 Authorization(配额查询/改写需要 apiKey 时使用) ──
+    // 注: 消息的"不可见"不在这里做 —— 已改为 context hook 按 message.id 剥除(见部件 0)。
     const onHttpRequest = async (evt: any): Promise<void> => {
       const req: Request = evt.request
       const providerID = String(evt?.model?.providerID ?? "")
@@ -221,8 +224,13 @@ export default Plugin.define({
     )
 
     // ── 部件 0: 请求构造期按 id 剥除本插件自建的消息(标记/回复) ──
-    // synthetic 在请求里会变成 user 消息; 在 context hook(HTTP 序列化之前)按 id 前缀整段丢掉,
-    // 模型永远看不到轮次标记/心跳/retry-setting 回复。旧实现的 id 同前缀, 一并覆盖。
+    // 两条互相独立的规则, 缺一不可:
+    //   ① resume(各 synthetic 调用点) 只决定"是否唤醒模型"(core/src/session/session.ts:174
+    //      `if (input.resume !== false) yield* execution.wake(sessionID)`), 不改变可见性;
+    //   ② 可见性只由本 hook 决定: 每次请求构造时按 message.id 前缀整段丢掉。
+    // 实测(移除本 hook 的副本 + mock): resume:false 的心跳标记会出现在之后每一轮请求里(17 次);
+    // 保留本 hook 时同场景 0 次。synthetic 一经 HTTP 序列化只剩 role/content, 所以必须在这里剥。
+    // 旧实现的 id(msg_quota-retry_* / msg_quota-retry-heartbeat-*)同前缀, 一并覆盖。
     yield* ctx.session.hook("context", (evt: any) =>
       Effect.sync(() => {
         try {
@@ -335,6 +343,8 @@ export default Plugin.define({
             id: markerID as any,
             text: markerText,
             description: `${MARKER_PREFIX} round · 第 ${round} 轮`,
+            // 必须唤醒: 这条标记就是下一轮的驱动(新执行 -> 全新 10 次原生重试)
+            resume: true,
           })
           .pipe(
             Effect.tap(() =>
@@ -474,6 +484,8 @@ export default Plugin.define({
                 id: `${MESSAGE_ID_PREFIX}-status-${Date.now().toString(36)}` as any,
                 description: `quota-retry · status (${[...expanded.keys()].length} providers)`,
                 text: statusReport(sessionID),
+                // 命令回复只给用户看: 不唤醒模型回合, 也不进模型请求(context hook 按 id 剥)
+                resume: false,
               })
               .pipe(Effect.asVoid, Effect.catch(() => Effect.void))
           }),

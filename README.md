@@ -12,6 +12,25 @@
 | [`packages/session-reaper`](packages/session-reaper) | Session registry + pipeline reaping (`keepDays` / `maxSessions`), reports back through a synthetic message, deletes through the native session API. |
 | [`packages/catalog-bridge`](packages/catalog-bridge) | Fills in model metadata (limits, cost, capabilities, variants) for custom providers from [models.dev](https://models.dev). |
 
+## Messages: visible to the user, never sent to the model
+
+opencode has **no display-only message type**: a `synthetic` message is mapped to a `user` message on the way to the provider, and `resume` only decides whether it *wakes* the runner. So every message a plugin shows to the user follows the same two-part rule:
+
+1. **`resume`** — `true` only when the message is real input (it drives the next round, or runs a task); `false` for pure notifications, so no model turn is started.
+2. **`context` hook by id** — each plugin drops its own messages (by message-id prefix) while the request is built, so they are never sent — neither on that request nor on any later one. `resume: false` alone does **not** hide a message from the model; it only avoids waking it.
+
+| Plugin | Message | When | `id` | `resume` | In model requests |
+|---|---|---|---|---|---|
+| quota-retry | round marker | native 10 attempts spent → next round | `msg_quota-retry-round-<N>-<ts>` | **true** (it is the driver) | stripped |
+| quota-retry | wait heartbeat | during a long wait, every `heartbeatMs` | `msg_quota-retry-heartbeat-<ts>` | **false** (only refreshes the location TTL) | stripped |
+| quota-retry | `/retry-setting` reply | user runs the command | `msg_quota-retry-status-<ts>` | **false** | stripped |
+| quota-retry | `quota-retry-status` tool output | the model calls the tool | (tool result) | — | kept (the model asked for it) |
+| session-reaper | command reply (`status` / `set` / `reap`) | user runs the command | `msg_session-reaper-reply-<ts>` | **false** | stripped |
+| session-reaper | `run` forwarded prompt | `/session-reaper run …` | (user message) | **true** (real task input) | kept |
+| catalog-bridge | — | — | — | — | — |
+
+`text` carries the payload (quota-retry markers use `EL-PSY-CONGROO-quota-retry-…` + a random token); `description` is the one-line label the UI renders (a message without one is never shown as a notice). quota-retry's older ids (`msg_quota-retry_*`, `msg_quota-retry-heartbeat-*`, …) share the same id prefix and are stripped as well.
+
 ## Install
 
 ```jsonc

@@ -22,9 +22,9 @@
 - 等待时长不封顶（原生 15 分钟 `RETRY_AFTER_MAX` 上限不适用于 hook 设置的 delay，已实测 16 分钟）。
 - 智谱配额 API（`open.bigmodel.cn/api/monitor/usage/quota/limit`）获取精确重置时刻，带 60s 缓存。
 - 429 body 中提取重置时间（`resetExtract` 正则，无时区后缀按 +08:00 解析，与 1.x 一致）。
-- **轮次续命（无限次数）**：原生 10 次耗尽后，从事件流捕获 `execution.failed`，注入一条 synthetic 通知行驱动新执行（= 全新 10 次原生重试，无限轮）。标记的 `id = msg_quota-retry-round-<N>-<ts>`（出口按 **id 前缀** `msg_quota-retry` 在 `context` hook 里剥除，确定性、不依赖文本），`text = "EL-PSY-CONGROO-quota-retry-round-" + 随机 token`（仅供 DB/日志辨认），`description = "quota-retry round · 第 N 轮"` 前台可见（长前缀不出现在界面）。不删失败现场——revert 无插件 API，已提上游 issue。
+- **轮次续命（无限次数）**：原生 10 次耗尽后，从事件流捕获 `execution.failed`，注入一条 synthetic 通知行驱动新执行（= 全新 10 次原生重试，无限轮）。标记的 `id = msg_quota-retry-round-<N>-<ts>`（出口按 **id 前缀** `msg_quota-retry` 在 `context` hook 里剥除，确定性、不依赖文本），`text = "EL-PSY-CONGROO-quota-retry-round-" + 随机 token`（仅供 DB/日志辨认），`description = "quota-retry round · 第 N 轮"` 前台可见（长前缀不出现在界面）；`resume: true` —— 这条标记就是下一轮的驱动。不删失败现场——revert 无插件 API，已提上游 issue。
 - **续命触发可配置**（`continueOn`）：默认对齐 1.x `maxRetries=-1` 的语义——opencode 原生会重试的那一类错误（`provider.quota` / `provider.rate-limit` / `provider.internal` / `provider.transport` / `provider.invalid-output` / `provider.unknown`）以及 429 + 全部 5xx；`denyTypes`（默认 auth / content-filter / invalid-request / unsupported-operation / no-route）一票否决；可用 `types` / `statuses` / `match` 正则覆盖默认（例如让某些 400 也续命）。
-- **出口净化**：`context` hook（HTTP 序列化之前）按消息 **id 前缀 `msg_quota-retry`** 整段丢掉本插件自建的消息（轮次标记 / 心跳 / `retry-setting` 回复——回复带 `description`，界面显示成一行通知；旧实现的 id `msg_quota-retry_*` / `msg_quota-retry-heartbeat-*` 同前缀，一并覆盖）。确定性匹配、不依赖文本内容，**不会误删真实用户消息**；第 2+ 轮请求与原始 turn 字节级一致（Docker 实测 45 次 429 全程同 hash）。
+- **出口净化**：`context` hook（HTTP 序列化之前）按消息 **id 前缀 `msg_quota-retry`** 整段丢掉本插件自建的消息（轮次标记 / 心跳 / `retry-setting` 回复——回复带 `description`，界面显示成一行通知；旧实现的 id `msg_quota-retry_*` / `msg_quota-retry-heartbeat-*` 同前缀，一并覆盖）。确定性匹配、不依赖文本内容，**不会误删真实用户消息**。注意 `resume: false` 只保证不唤醒模型，**不改变可见性**（实测：无过滤时，`resume: false` 的心跳标记会出现在后续所有请求里），可见性完全由这个 hook 决定；第 2+ 轮请求与原始 turn 字节级一致（Docker 实测 45 次 429 全程同 hash）。
 - **运行日志（默认关闭，排查时开）**：配置 `logFile: true` 打开（默认路径 `~/.cache/opencode/buraunkan/quota-retry.log`，512KB 上限自动截断），或给自定义路径；缺省 / `false` = 关闭。只记关键决策：判定命中与算出的等待、心跳发送/失败、加载/卸载与错误 —— 用于事后定位"等待为什么没撑住"这类问题。
 - 用户接管：续命过程中用户发新消息自动停止续命让位。
 - `quota-retry-status` 工具 + `/retry-setting` 命令（`ctx.session.synthetic` 零模型回复）。
@@ -78,7 +78,7 @@
 
 - `continueOn.types` / `statuses` / `match` 任一命中即续命；`denyTypes` 优先（默认含 auth/content-filter/invalid-request/unsupported-operation/no-route）。要在默认 deny 的类型上续命，需显式把它从 `denyTypes` 移除（如 `"denyTypes": []`）。
 - `continueOn.statuses` 缺省 = 429 与全部 5xx。
-- `heartbeatMs`（默认 2700000 = 45 分钟）：**长等待心跳**。opencode 的 location 不活动回收在 60 分钟内没有 durable 会话事件时会以 `reason: "inactivity"` 打断正在等待的执行（`packages/core/src/location-activity.ts`：TTL 写死 60 分钟、只被"带 location 的 durable 会话事件"刷新、无配置口），而"等待配额重置"期间不产生任何事件，所以超过 60 分钟的等待会被掐断（实测：等待开始后 61 分钟 `location services evicted` + `outcome=interrupted`）。心跳 = 等待期间每 45 分钟落一条 durable 标记（`session.synthetic`，`resume: false` → 只入队不唤醒，**不打断睡眠**），让 TTL 持续被刷新；标记 `id = msg_quota-retry-heartbeat-<ts>`（与轮次标记同样在 `context` hook 里按 id 前缀剥除），**不进入模型请求**；界面只显示 `quota-retry heartbeat · 内部标记(不发给模型)` 这行标签，长前缀不出现在界面。等待本身仍是一次到重置点（不切段）。代价：每次心跳在会话里多一条标记行。设 `0` 关闭。
+- `heartbeatMs`（默认 2700000 = 45 分钟）：**长等待心跳**。opencode 的 location 不活动回收在 60 分钟内没有 durable 会话事件时会以 `reason: "inactivity"` 打断正在等待的执行（`packages/core/src/location-activity.ts`：TTL 写死 60 分钟、只被"带 location 的 durable 会话事件"刷新、无配置口），而"等待配额重置"期间不产生任何事件，所以超过 60 分钟的等待会被掐断（实测：等待开始后 61 分钟 `location services evicted` + `outcome=interrupted`）。心跳 = 等待期间每 45 分钟落一条 durable 标记（`session.synthetic`，`resume: false` → 只入队不唤醒，**不打断睡眠**），让 TTL 持续被刷新；标记 `id = msg_quota-retry-heartbeat-<ts>`（与轮次标记同样在 `context` hook 里按 id 前缀剥除），**不进入模型请求**；界面只显示 `quota-retry heartbeat` 这行标签，长前缀不出现在界面。等待本身仍是一次到重置点（不切段）。代价：每次心跳在会话里多一条标记行。设 `0` 关闭。
   - **实现方式（effect 形态的原因）**：心跳是**插件自己的定时 fiber**——每个长等待 `Effect.forkScoped` 一个 `Effect.sleep` 循环，等待结束（`step.started` / `interrupted` / `succeeded` / `execution.failed`）即中断，插件卸载时随 Scope 自动清理。定时能力来自 opencode 宿主提供的 Effect 运行时（与内置插件 `provider/digitalocean.ts` 的周期循环同一原语），**不依赖任何宿主周期事件**。
 
 ## 安装
