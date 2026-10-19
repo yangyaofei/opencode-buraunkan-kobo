@@ -179,9 +179,9 @@ export async function zhipuResetAtMs(
   }
 }
 
-// 轮次标记的文本前缀。标记的 text = 前缀 + 随机 token: 既让出站过滤能精确识别
-// "这必然是我们注入的"(不靠"空字符串"这种可能撞上真实用户输入的判据), 也让它在
-// session DB / 日志里一眼可辨。
+// 轮次标记的文本前缀。标记的 text = 前缀 + 随机 token。
+// 注意: 出口过滤已改为按 message.id(MESSAGE_ID_PREFIX)剥, 不再依赖文本;
+// text 前缀只用于在 session DB / 日志里一眼辨认"这是插件注入的", 以及界面显示时的可读性。
 export const MARKER_TEXT_PREFIX = "EL-PSY-CONGROO-quota-retry-round-"
 // 心跳标记的前缀(与轮次标记分开命名, 语义各归各的)
 export const HEARTBEAT_TEXT_PREFIX = "EL-PSY-CONGROO-quota-retry-heartbeat-"
@@ -241,6 +241,11 @@ export function isPluginMessageId(id: unknown): boolean {
   // 必须带分隔符边界: msg_quota-retry-*(新) / msg_quota-retry_*(旧)
   return typeof id === "string" && /^msg_quota-retry[-_]/.test(id)
 }
+
+// 为什么按 id 而不是文本: synthetic 到 provider 只剩 role/content(to-llm-message.ts:287-288),
+// http.request 阶段已看不到 id 与 type; 而 context hook 在序列化之前拿到 Message[], id 仍在,
+// 因此在那里按 id 前缀剥除是确定性做法(不会误删真实用户消息, 也覆盖旧标记)。
+// 为什么 resume 不够: resume 只控制 execution.wake(session.ts:174), 不改变消息是否进请求。
 
 // ── provider 凭据读取(opencode.db credential 表, 参考 OpenChamber credential-db.js) ──
 // 2.x 没有 HTTP 路由交回 apiKey; 凭据存 <dataDir>/opencode.db 的 credential 表(明文 JSON)。

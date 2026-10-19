@@ -93,6 +93,8 @@ export default {
     }
 
     // 请求构造期按 id 剥除本插件的命令回复(synthetic 在请求里会变成 user 消息)。
+    // 与 quota-retry 同一套规则: resume 只决定是否唤醒(session.ts:174), 可见性只由本 hook 决定;
+    // 因此命令回复用 resume:false 且在这里剥掉, 而 run 转发的真实 prompt 不在此列(它必须进模型)。
     await ctx.session.hook("context", async (evt: any) => {
       if (!Array.isArray(evt?.messages)) return
       const kept = evt.messages.filter((m: any) => !(typeof m?.id === "string" && m.id.startsWith("msg_session-reaper-")))
