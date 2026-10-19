@@ -36,7 +36,7 @@ registry 落 `~/.local/state/opencode/session-reaper/registry.json`（XDG_STATE_
 
 ## 命令回复不进入模型请求
 
-命令回复用 `session.synthetic` 写入会话（前台可见），`id` 自指定为 `msg_session-reaper-reply-<ts>`，并带 `description`（`session-reaper · <action>`）供界面显示成一行通知；插件在 `context` hook（HTTP 序列化之前）按该 id 前缀剔除，因此这些回复不会进入模型请求。
+命令回复用 `session.synthetic` 写入会话（前台可见），`id` 自指定为 `msg_session-reaper-reply-<ts>`，并带 `description`（`session-reaper · <action>`）供界面显示成一行通知；插件在 `context` hook（HTTP 序列化之前）按该 id 前缀剔除，因此这些回复不会进入模型请求；回复的 `resume: false` 只保证不唤醒模型回合。（`run` 子命令转发的用户 prompt 是真正的任务输入，保持 `resume: true` 且不被过滤。）
 
 ## 已知限制（2.0.15 平台行为）
 
