@@ -76,14 +76,16 @@ export default {
   setup: async (ctx: Ctx) => {
     const projectDir = ctx.location?.directory ?? process.cwd()
 
-    const reply = async (sessionID: string, text: string) => {
+    // label: 通知行在界面上的标签(OpenChamber/TUI 只把"带 description 的 synthetic"显示成一行通知)。
+    const reply = async (sessionID: string, text: string, label = "reply") => {
       // 注意: 同一 session 首条之后 runner 可能不再主动消费 inbox(2.0.15 平台行为),
       // 后续回复滞留 /api/session/:id/inbox, 该 session 下次 agent loop 运行时显示
       // —— 见 README "已知限制"
       // id 自指定: 这些回复属于本插件, 在 context hook 里按 id 剥掉, 不进入模型请求。
       await ctx.session.synthetic({
         sessionID,
-        id: `msg_session-reaper-reply-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}` as any,
+        id: `msg_session-reaper-reply-${Date.now().toString(36)}` as any,
+        description: `session-reaper · ${label}`,
         text,
       })
     }
@@ -159,7 +161,7 @@ export default {
 
           // ---- status: 桶状态报告(零模型) ----
           if (parsed.action === "status") {
-            await reply(sessionID, statusReport(cfg, loadRegistry(registryFile), registryFile))
+            await reply(sessionID, statusReport(cfg, loadRegistry(registryFile), registryFile), "status")
             return
           }
 
@@ -212,6 +214,7 @@ export default {
               await reply(
                 sessionID,
                 `[session-reaper] ${name} 配置已更新: keepDays=${cfg.pipelines[name].keepDays ?? "(未设)"} maxSessions=${cfg.pipelines[name].maxSessions ?? "(未设)"}`,
+                "set",
               )
               return
             }
@@ -220,6 +223,7 @@ export default {
             await reply(
               sessionID,
               `[session-reaper] ${name}: keepDays=${rule.keepDays ?? "不清理"} maxSessions=${rule.maxSessions ?? "不限"} (${rule.explicit ? "显式配置" : "default 兜底"})\n改变行为: /session-reaper set --pipeline ${name} --keep-days N --max-sessions M`,
+              "set",
             )
             return
           }
@@ -250,7 +254,7 @@ export default {
             ]
             for (const e of reaped) lines.push(`  已删除 ${e.id} (${ageText(e.created, Date.now())})`)
             for (const e of failed) lines.push(`  删除失败(保留重试) ${e.id}`)
-            await reply(sessionID, lines.join("\n"))
+            await reply(sessionID, lines.join("\n"), "reap")
             return
           }
         },

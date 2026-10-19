@@ -146,7 +146,7 @@ export default Plugin.define({
       return ctx.session
         .synthetic({
           sessionID: sid as any,
-          id: `${MESSAGE_ID_PREFIX}-heartbeat-${now.toString(36)}-${Math.random().toString(36).slice(2, 8)}` as any,
+          id: `${MESSAGE_ID_PREFIX}-heartbeat-${now.toString(36)}` as any,
           text: `${HEARTBEAT_TEXT_PREFIX}${Math.random().toString(36).slice(2, 10)}`,
           description: `${MARKER_PREFIX} heartbeat · 内部标记(不发给模型)`,
           resume: false,
@@ -327,7 +327,7 @@ export default Plugin.define({
       Effect.gen(function* () {
         // 标记 text = 前缀 + 随机 token: 出口按前缀精确剥掉(不靠"空"判定),
         // description 前台可见, id 自指定便于定位。
-        const markerID = `${MESSAGE_ID_PREFIX}-round-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+        const markerID = `${MESSAGE_ID_PREFIX}-round-${round}-${Date.now().toString(36)}`
         const markerText = `${MARKER_TEXT_PREFIX}${Math.random().toString(36).slice(2, 10)}`
         yield* ctx.session
           .synthetic({
@@ -472,6 +472,7 @@ export default Plugin.define({
               .synthetic({
                 sessionID: sessionID as any,
                 id: `${MESSAGE_ID_PREFIX}-status-${Date.now().toString(36)}` as any,
+                description: "quota-retry · status",
                 text: statusReport(sessionID),
               })
               .pipe(Effect.asVoid, Effect.catch(() => Effect.void))
