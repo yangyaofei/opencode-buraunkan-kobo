@@ -345,6 +345,12 @@ export default Plugin.define({
       Effect.gen(function* () {
         const type = ev?.type
         const data = ev?.data ?? ev
+        // 事件流是全 location 广播(每个实例都收到): 只处理本实例自己 location 的事件。
+        // 否则同一个会话会被每个实例各处理一遍(重复心跳 / 重复续命 / 重复标记——
+        // 实测 3 个 location 实例 = 3 条重复标记)。会话事件都带 location 信封
+        // (bus.publish 从发布者上下文的 Location.Service 取), 无 location 的全局事件与本插件无关。
+        const evLoc = String(ev?.location?.directory ?? "")
+        if (evLoc !== String(ctx.location?.directory ?? "")) return
         if (type === "session.inbox.enqueued" && data?.item?.type === "user") {
           // 用户接管: 仅在本 turn 已处于续命救援中才算接管(初始 prompt 的入队不算,
           // 否则每个 turn 的第一次入队就会把续命全关掉)。
@@ -381,10 +387,7 @@ export default Plugin.define({
           // 在 hook 里 arm 会被随后的 step.started 删掉(实测: arm 后同秒被 disarm, 心跳永不发)。
           const sid = String(data.sessionID ?? "")
           const at = Number(data.at)
-          // 事件流是全 location 广播(每个实例都收到): 只有本实例自己 location 的会话才 arm,
-          // 否则同一会话会被每个实例各发一条心跳(实测 3 实例 = 3 条重复标记)。
-          const evLoc = String(ev?.location?.directory ?? "")
-          if (evLoc === String(ctx.location?.directory ?? "") && sid && Number.isFinite(at)) {
+          if (sid && Number.isFinite(at)) {
             yield* armHeartbeat(sid, at - Date.now())
           }
           return
