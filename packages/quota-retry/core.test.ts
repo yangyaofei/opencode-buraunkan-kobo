@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import {
   computeWaitMs,
+  dueHeartbeats,
   expandProviders,
   isQuotaError,
   isQuotaResponse,
@@ -289,6 +290,23 @@ describe("needsHeartbeat", () => {
   test("非法等待时长 → 不需要心跳", () => {
     expect(needsHeartbeat(Number.NaN, 2_700_000)).toBe(false)
     expect(needsHeartbeat(0, 2_700_000)).toBe(false)
+  })
+})
+
+describe("dueHeartbeats(事件驱动的到期检查)", () => {
+  test("只返回到期的 sid, 未到期的不动", () => {
+    const m = new Map([
+      ["a", 1000],
+      ["b", 2000],
+    ])
+    expect(dueHeartbeats(m, 1500)).toEqual(["a"])
+    expect(dueHeartbeats(m, 999)).toEqual([])
+  })
+  test("now == 到期时刻 → 算到期(>=)", () => {
+    expect(dueHeartbeats(new Map([["a", 1000]]), 1000)).toEqual(["a"])
+  })
+  test("空 map → 空数组(宿主每次事件都会调用, 必须廉价无副作用)", () => {
+    expect(dueHeartbeats(new Map(), 123)).toEqual([])
   })
 })
 

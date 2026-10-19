@@ -24,11 +24,12 @@
 //      chunk 是 JSC bytecode, 明文补丁无效 — 已实验证明)
 //   ✅ TUI 可见性(原生徽标 + 每轮覆写的通知行 "quota-retry · 第 N 轮")
 //   ✅ quota_retry_status 工具 / retry-setting 命令(零模型回复)
-//   ✅ 长等待心跳(等待期间定期落 durable 标记, 刷新 opencode location 的 60 分钟不活动 TTL)
+//   ✅ 长等待心跳(等待期间由宿主事件驱动落 durable 标记, 刷新 opencode location 的 60 分钟不活动 TTL)
 //   ❌ on-demand 降级链: 已移除(2.0 无模型路由能力; 见 issue #2)
 
 import {
   computeWaitMs,
+  dueHeartbeats,
   expandProviders,
   isQuotaError,
   isQuotaResponse,
@@ -66,8 +67,9 @@ type Ctx = {
 
 const MARKER_PREFIX = "quota-retry"
 
-// 运行日志(默认常开): 出事时能直接看到每个 hook 收到了什么、判定结果与算出的等待。
-// 路径 ~/.cache/opencode/buraunkan/quota-retry.log; 可用配置 logFile 覆盖或 false 关闭。
+// 运行日志(默认关闭, 排查时开): 只记关键决策(判定命中/算出的等待/心跳发送与失败/加载卸载/错误)。
+// 开启: 配置 logFile: true(默认路径 ~/.cache/opencode/buraunkan/quota-retry.log)或自定义路径;
+// 缺省/false = 关闭。
 let LOG_FILE: string | null = null
 
 function dbg(...a: any[]) {
@@ -97,7 +99,7 @@ export default {
   setup: async (ctx: Ctx) => {
     const projectDir = ctx.location?.directory ?? process.cwd()
     const cfg = loadConfig(projectDir)
-    LOG_FILE = cfg.logFile === false ? null : String(cfg.logFile ?? defaultLogFile())
+    LOG_FILE = cfg.logFile === true ? defaultLogFile() : cfg.logFile ? String(cfg.logFile) : null
     const quotaCacheMs = cfg.quotaCacheMs ?? DEFAULT_QUOTA_CACHE_MS
     const maxRounds = cfg.maxRounds ?? Number(process.env.QUOTA_RETRY_MAX_ROUNDS ?? -1)
 
@@ -127,39 +129,42 @@ export default {
     // ── 部件 1c: 长等待心跳 ──
     // 等待期间不产生 durable 会话事件, 而 opencode 的 location 不活动回收(60 分钟 TTL, 只被
     // "带 location 的 durable 会话事件"刷新, core/src/location-activity.ts)会把长等待打断。
-    // 心跳 = 等待期间定期落一条 durable 标记(session.synthetic, resume:false → 只入队不唤醒,
+    // 心跳 = 等待期间落一条 durable 标记(session.synthetic, resume:false → 只入队不唤醒,
     // 不打断睡眠); 标记文本用同一前缀, 出口会被 strip 剥掉, 不进入模型请求。
+    // 发送时机: 由宿主事件驱动(见 pumpHeartbeats), 不自建定时器——插件只做被调用时能做的事。
     const heartbeatMs = Number(cfg.heartbeatMs ?? DEFAULT_HEARTBEAT_MS)
+    dbg("[boot] setup:", String(ctx.location?.directory ?? ""), "heartbeatMs=", heartbeatMs)
     const heartbeats = new Map<string, number>() // sid -> 下一次心跳时刻
     const armHeartbeat = (sid: string, delayMs: number) => {
       if (!sid || !needsHeartbeat(delayMs, heartbeatMs)) return
+      dbg("[heartbeat] arm:", sid, "heartbeatMs=", heartbeatMs)
       heartbeats.set(sid, Date.now() + heartbeatMs)
     }
-    const disarmHeartbeat = (sid: string) => {
-      heartbeats.delete(sid)
+    const disarmHeartbeat = (sid: string, reason: string) => {
+      if (heartbeats.delete(sid)) dbg("[heartbeat] disarm:", reason, sid)
     }
-    const heartbeatTimer = setInterval(() => {
-      void (async () => {
-        const now = Date.now()
-        for (const [sid, due] of [...heartbeats]) {
-          if (now < due) continue
-          heartbeats.set(sid, now + heartbeatMs)
-          try {
-            await ctx.session.synthetic({
-              sessionID: sid,
-              id: `msg_${MARKER_TEXT_PREFIX}_hb_${now.toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
-              text: `${MARKER_TEXT_PREFIX}-hb-${Math.random().toString(36).slice(2, 10)}`,
-              description: `${MARKER_TEXT_PREFIX} · 等待心跳 · 内部标记(不发给模型)`,
-              resume: false,
-            })
-            dbg("[heartbeat] synthetic:", sid)
-          } catch (err: any) {
-            dbg("[heartbeat] FAIL:", String(err?.message ?? err).slice(0, 160))
-            heartbeats.delete(sid)
-          }
+    // 心跳发送: 由**宿主事件驱动**(插件是被调用者: 只做被调用时能做的事, 不自建定时器)。
+    // 宿主每 ~5 分钟推 provider.updated/model.updated, 加上同 location 的会话事件,
+    // 每次被调用时顺手检查"有没有到期的等待", 到期就落一条 durable 标记。
+    const pumpHeartbeats = async () => {
+      const now = Date.now()
+      for (const sid of dueHeartbeats(heartbeats, now)) {
+        heartbeats.set(sid, now + heartbeatMs)
+        try {
+          await ctx.session.synthetic({
+            sessionID: sid,
+            id: `msg_${MARKER_TEXT_PREFIX}_hb_${now.toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
+            text: `${MARKER_TEXT_PREFIX}-hb-${Math.random().toString(36).slice(2, 10)}`,
+            description: `${MARKER_TEXT_PREFIX} · 等待心跳 · 内部标记(不发给模型)`,
+            resume: false,
+          })
+          dbg("[heartbeat] sent:", sid)
+        } catch (err: any) {
+          dbg("[heartbeat] FAIL:", String(err?.message ?? err).slice(0, 160))
+          heartbeats.delete(sid)
         }
-      })()
-    }, 60_000)
+      }
+    }
 
     // 本 turn 是否处于"续命救援"中(配额精确等待命中, 或已开始轮次)
     const inRescue = (sid: string) => quotaHit.has(sid) || rounds.has(sid)
@@ -169,7 +174,7 @@ export default {
       stopped.delete(sid)
       quotaHit.delete(sid)
       lastFailure.delete(sid)
-      disarmHeartbeat(sid)
+      disarmHeartbeat(sid, "succeeded")
     }
 
     // ── 部件 3: 出口净化 — 剥掉尾部"轮次标记"映射出的 user 消息 ──
@@ -190,7 +195,6 @@ export default {
               const headers = new Headers(req.headers)
               headers.delete("content-length")
               evt.request = new Request(req, { method: "POST", headers, body: JSON.stringify({ ...body, messages: stripped }) })
-              dbg("[strip] removed trailing marker user message(s)")
             }
           }
         }
@@ -216,15 +220,11 @@ export default {
         const providerID = String(evt?.model?.providerID ?? "")
         const p = expanded.get(providerID)
         const status = Number(evt?.response?.status)
-        // 配置过的 provider: 每个响应记一行(用来回答"第一次失败到底收到了什么")
-        if (p) dbg("[resp]", providerID, status, evt?.kind)
         const statuses = p?.statuses ?? DEFAULT_QUOTA_STATUSES
         if (!Number.isFinite(status) || !statuses.includes(status)) return
-        dbg("[resp-hook] quota-status:", providerID, status, evt?.kind)
         try {
           const text = await evt.response.clone().text()
           recent429.set(String(evt.sessionID), { at: Date.now(), status, text })
-          dbg("[resp-hook] captured:", text.slice(0, 160))
         } catch (err) {
           dbg("[resp-hook] clone/text err:", String(err))
         }
@@ -239,34 +239,13 @@ export default {
       const providerID = String(evt?.model?.providerID ?? "")
       const type = evt?.error?.type
       const message = String(evt?.error?.message ?? "")
-      dbg(
-        "[retry-hook] fired:",
-        providerID,
-        String(type ?? ""),
-        String(evt?.error?.status ?? ""),
-        message.slice(0, 60),
-      )
       const p = expanded.get(providerID)
       const captured = recent429.get(sessionID)
       // ① 响应驱动(对齐 1.x): 捕获到的原始响应命中"状态码 ∈ statuses + 正文命中 quotaMatch"。
       const byResponse = captured ? isQuotaResponse(captured.status, captured.text, p) : false
       // ② 兜底: 没抓到响应时用 opencode 归纳出的错误(type == provider.quota 或文案命中正则)。
       const byError = !byResponse && isQuotaError(type, message, p?.quotaMatch)
-      if (!byResponse && !byError) {
-        dbg(
-          "[decision] pass:",
-          providerID,
-          "errStatus=",
-          String(evt?.error?.status ?? ""),
-          "captured=",
-          captured ? captured.status : "none",
-          "type=",
-          String(type ?? ""),
-          "msg=",
-          message.slice(0, 80),
-        )
-        return
-      }
+      if (!byResponse && !byError) return
 
       quotaHit.add(sessionID)
       const now = Date.now()
@@ -285,7 +264,8 @@ export default {
       }
       const delay = computeWaitMs({ now, resetAtMs, bufferMs: p?.bufferMs, fallbackWaitMs: p?.fallbackWaitMs })
       evt.decision = { retry: true, delay }
-      armHeartbeat(sessionID, delay)
+      // 心跳不在这里 arm: 排定重试的同一流程里宿主会先发 step.started(会 disarm), 随后才是
+      // retry.scheduled。统一由事件循环里的 session.retry.scheduled 按排定时刻 arm, 顺序确定。
       dbg(
         `[decision] engage: attempt=${evt?.attempt} via=${byResponse ? "response" : "error"} delayMs=${delay} (${humanWait(delay)}) resetAtMs=${resetAtMs}`,
       )
@@ -320,6 +300,8 @@ export default {
       try {
         for await (const ev of ctx.event.subscribe()) {
           try {
+            // 宿主每次调用我们(任意事件)时, 顺手检查有没有到期的心跳。
+            void pumpHeartbeats()
             const type = (ev as any).type
             const data = (ev as any).data ?? ev
             if (type === "session.inbox.enqueued" && data?.item?.type === "user") {
@@ -340,20 +322,30 @@ export default {
                   message: String(err.message ?? ""),
                 })
               }
-              dbg("[ev] step.failed:", JSON.stringify(data).slice(0, 300))
               continue
-            }
-            if (type === "session.execution.failed") {
-              dbg("[ev] execution.failed:", JSON.stringify(data).slice(0, 300))
             }
             if (type === "session.execution.interrupted") {
               stopped.add(data.sessionID)
-              disarmHeartbeat(String(data.sessionID ?? ""))
+              disarmHeartbeat(String(data.sessionID ?? ""), "interrupted")
               continue
             }
             if (type === "session.step.started") {
               // 等待结束、步骤已开始 → 不再需要心跳(下一次等待会重新 arm)
-              disarmHeartbeat(String(data.sessionID ?? ""))
+              disarmHeartbeat(String(data.sessionID ?? ""), "step.started")
+              continue
+            }
+            if (type === "session.retry.scheduled") {
+              // 重试已排定(durable, 带绝对时刻 at) → 按剩余等待 arm 长等待心跳。
+              // 必须在这里而不是 retry hook: 宿主排定重试的同一流程里会先发 step.started,
+              // 在 hook 里 arm 会被随后的 step.started 删掉(实测: arm 后同秒被 disarm, 心跳永不发)。
+              const sid = String(data.sessionID ?? "")
+              const at = Number(data.at)
+              // 事件流是全 location 广播(每个实例都收到): 只有本实例自己 location 的会话才 arm,
+              // 否则同一会话会被每个实例各发一条心跳(实测 3 实例 = 3 条重复标记)。
+              const evLoc = String((ev as any).location?.directory ?? "")
+              if (evLoc === String(ctx.location?.directory ?? "") && sid && Number.isFinite(at)) {
+                armHeartbeat(sid, at - Date.now())
+              }
               continue
             }
             if (type === "session.execution.succeeded") {
@@ -366,7 +358,6 @@ export default {
             // 续命触发: 配额救援中, 或失败错误命中续命策略(可重试类型 / 429+5xx / 自定义 match)。
             const failure = data.error ?? lastFailure.get(sid)
             if (!inRescue(sid) && !shouldContinue(failure, cfg?.continueOn)) continue
-            dbg("[ev] continue:", JSON.stringify(failure ?? null).slice(0, 200))
             const n = (rounds.get(sid) ?? 0) + 1
             if (maxRounds >= 0 && n > maxRounds) {
               console.log(`[quota-retry] ${sid} 达到轮数上限 ${maxRounds}, 停止续命`)
@@ -425,7 +416,7 @@ export default {
 
     // 卸载: setup 返回 cleanup(2.0 由宿主在插件卸载时调用)
     return () => {
-      clearInterval(heartbeatTimer)
+      dbg("[unload] cleanup:", String(ctx.location?.directory ?? ""), "heartbeats=", heartbeats.size)
       heartbeats.clear()
       recent429.clear()
       zhipuCache.clear()
