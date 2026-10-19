@@ -5,5 +5,9 @@
   "type": "module",
   "exports": {
     "./server": "./server.ts"
+  },
+  "peerDependencies": {
+    "@opencode/plugin": "*",
+    "effect": "^4.0.0"
   }
 }

@@ -13,7 +13,7 @@
 }
 ```
 
-- 一个包 = 一个插件（2.0 加载契约：默认导出 `{ id, setup }`），删行即停用。
+- 一个包 = 一个插件（2.0 加载契约：默认导出 `{ id, effect }`，effect 形态），删行即停用。
 - 与 1.x 版的功能/配置项逐项对照见 [docs/v1-v2-parity.md](../../docs/v1-v2-parity.md)。
 
 ## 功能
@@ -78,7 +78,8 @@
 
 - `continueOn.types` / `statuses` / `match` 任一命中即续命；`denyTypes` 优先（默认含 auth/content-filter/invalid-request/unsupported-operation/no-route）。要在默认 deny 的类型上续命，需显式把它从 `denyTypes` 移除（如 `"denyTypes": []`）。
 - `continueOn.statuses` 缺省 = 429 与全部 5xx。
-- `heartbeatMs`（默认 2700000 = 45 分钟）：**长等待心跳**。opencode 的 location 不活动回收在 60 分钟内没有 durable 会话事件时会以 `reason: "inactivity"` 打断正在等待的执行（`packages/core/src/location-activity.ts`：TTL 写死 60 分钟、只被"带 location 的 durable 会话事件"刷新、无配置口），而"等待配额重置"期间不产生任何事件，所以超过 60 分钟的等待会被掐断（实测：等待开始后 61 分钟 `location services evicted` + `outcome=interrupted`）。心跳 = 等待期间落 durable 标记（`session.synthetic`，`resume: false` → 只入队不唤醒，**不打断睡眠**；发送时机由宿主事件驱动——插件只做被调用时能做的事，每次收到事件时检查是否到期，间隔默认 45 分钟），让 TTL 持续被刷新；标记文本用同一前缀，出口会被剥掉，**不进入模型请求**。等待本身仍是一次到重置点（不切段）。代价：每次心跳在会话里多一条标记行。设 `0` 关闭。
+- `heartbeatMs`（默认 2700000 = 45 分钟）：**长等待心跳**。opencode 的 location 不活动回收在 60 分钟内没有 durable 会话事件时会以 `reason: "inactivity"` 打断正在等待的执行（`packages/core/src/location-activity.ts`：TTL 写死 60 分钟、只被"带 location 的 durable 会话事件"刷新、无配置口），而"等待配额重置"期间不产生任何事件，所以超过 60 分钟的等待会被掐断（实测：等待开始后 61 分钟 `location services evicted` + `outcome=interrupted`）。心跳 = 等待期间每 45 分钟落一条 durable 标记（`session.synthetic`，`resume: false` → 只入队不唤醒，**不打断睡眠**），让 TTL 持续被刷新；标记文本用同一前缀，出口会被剥掉，**不进入模型请求**。等待本身仍是一次到重置点（不切段）。代价：每次心跳在会话里多一条标记行。设 `0` 关闭。
+  - **实现方式（effect 形态的原因）**：心跳是**插件自己的定时 fiber**——每个长等待 `Effect.forkScoped` 一个 `Effect.sleep` 循环，等待结束（`step.started` / `interrupted` / `succeeded` / `execution.failed`）即中断，插件卸载时随 Scope 自动清理。定时能力来自 opencode 宿主提供的 Effect 运行时（与内置插件 `provider/digitalocean.ts` 的周期循环同一原语），**不依赖任何宿主周期事件**。
 
 ## 安装
 
