@@ -161,7 +161,15 @@ export default {
 
           // ---- status: 桶状态报告(零模型) ----
           if (parsed.action === "status") {
-            await reply(sessionID, statusReport(cfg, loadRegistry(registryFile), registryFile), "status")
+            {
+              const reg = loadRegistry(registryFile)
+              const pipelines = new Set([...Object.keys(reg), ...Object.keys(cfg.pipelines ?? {})]).size
+              await reply(
+                sessionID,
+                statusReport(cfg, reg, registryFile),
+                `status (${pipelines} pipelines)`,
+              )
+            }
             return
           }
 
@@ -214,7 +222,7 @@ export default {
               await reply(
                 sessionID,
                 `[session-reaper] ${name} 配置已更新: keepDays=${cfg.pipelines[name].keepDays ?? "(未设)"} maxSessions=${cfg.pipelines[name].maxSessions ?? "(未设)"}`,
-                "set",
+                `set ${name}` + (parsed.keepDays === undefined && parsed.maxSessions === undefined ? " (view)" : ""),
               )
               return
             }
@@ -223,7 +231,7 @@ export default {
             await reply(
               sessionID,
               `[session-reaper] ${name}: keepDays=${rule.keepDays ?? "不清理"} maxSessions=${rule.maxSessions ?? "不限"} (${rule.explicit ? "显式配置" : "default 兜底"})\n改变行为: /session-reaper set --pipeline ${name} --keep-days N --max-sessions M`,
-              "set",
+              `set ${name} (view)`,
             )
             return
           }
@@ -254,7 +262,7 @@ export default {
             ]
             for (const e of reaped) lines.push(`  已删除 ${e.id} (${ageText(e.created, Date.now())})`)
             for (const e of failed) lines.push(`  删除失败(保留重试) ${e.id}`)
-            await reply(sessionID, lines.join("\n"), "reap")
+            await reply(sessionID, lines.join("\n"), `reap ${parsed.pipeline}: 删除 ${reaped.length}, 失败 ${failed.length}, 存活 ${survivors.length}`)
             return
           }
         },

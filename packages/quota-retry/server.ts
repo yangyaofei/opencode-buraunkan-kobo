@@ -148,7 +148,7 @@ export default Plugin.define({
           sessionID: sid as any,
           id: `${MESSAGE_ID_PREFIX}-heartbeat-${now.toString(36)}` as any,
           text: `${HEARTBEAT_TEXT_PREFIX}${Math.random().toString(36).slice(2, 10)}`,
-          description: `${MARKER_PREFIX} heartbeat · 内部标记(不发给模型)`,
+          description: `${MARKER_PREFIX} heartbeat`,
           resume: false,
         })
         .pipe(Effect.asVoid)
@@ -472,7 +472,7 @@ export default Plugin.define({
               .synthetic({
                 sessionID: sessionID as any,
                 id: `${MESSAGE_ID_PREFIX}-status-${Date.now().toString(36)}` as any,
-                description: "quota-retry · status",
+                description: `quota-retry · status (${[...expanded.keys()].length} providers)`,
                 text: statusReport(sessionID),
               })
               .pipe(Effect.asVoid, Effect.catch(() => Effect.void))
