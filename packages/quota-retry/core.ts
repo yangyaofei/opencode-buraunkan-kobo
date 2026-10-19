@@ -116,15 +116,6 @@ export function isQuotaResponse(
   return isQuotaText(text, p?.quotaMatch)
 }
 
-// 心跳到期检查(纯函数): 返回已经到期的 sessionID 列表。
-// 心跳由**宿主事件驱动**发送(插件是被调用者: hook/事件回调都是宿主来调, 不建自建定时器),
-// 每次被调用时用它算"有没有该发的", 到期就落一条 durable 标记刷新 location 的 60 分钟 TTL。
-export function dueHeartbeats(map: ReadonlyMap<string, number>, now: number): string[] {
-  const due: string[] = []
-  for (const [sid, at] of map) if (now >= at) due.push(sid)
-  return due
-}
-
 // 从 429 body 提取重置时刻(捕获组 1 = 完整时间串); 无时区后缀按 +08:00 解析。
 // 返回绝对毫秒时间戳; 解析失败返回 NaN。
 export function parseResetAtMs(text: string, resetExtract?: string): number {
