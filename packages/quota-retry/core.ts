@@ -183,6 +183,10 @@ export async function zhipuResetAtMs(
 // "这必然是我们注入的"(不靠"空字符串"这种可能撞上真实用户输入的判据), 也让它在
 // session DB / 日志里一眼可辨。
 export const MARKER_TEXT_PREFIX = "quota-retry-round-"
+// 心跳标记的前缀(与轮次标记分开命名, 语义各归各的)
+export const HEARTBEAT_TEXT_PREFIX = "quota-retry-heartbeat-"
+// 出口净化认识的全部标记前缀(任意位置、按前缀整段剥除)
+export const MARKER_TEXT_PREFIXES = [MARKER_TEXT_PREFIX, HEARTBEAT_TEXT_PREFIX] as const
 
 // 续命默认可续的错误类型 = opencode 原生 isRetryable 的那一组
 // (RateLimit/ProviderInternal/Transport/InvalidProviderOutput/UnknownProvider + 插件翻转的 Quota)
@@ -231,34 +235,35 @@ export function shouldContinue(
 
 // 判定一条 content 是不是本插件注入的标记: 字符串直接看前缀; parts 形态要求
 // 全部文本 part 都带前缀(避免把用户真实消息误判为标记)。
-export function isMarkerText(content: unknown, prefix: string = MARKER_TEXT_PREFIX): boolean {
-  if (typeof content === "string") return content.startsWith(prefix)
+export function isMarkerText(
+  content: unknown,
+  prefixes: string | readonly string[] = MARKER_TEXT_PREFIXES,
+): boolean {
+  const list = typeof prefixes === "string" ? [prefixes] : prefixes
+  const matches = (text: unknown) =>
+    typeof text === "string" && list.some((prefix) => text.startsWith(prefix))
+  if (typeof content === "string") return matches(content)
   if (Array.isArray(content)) {
     const texts = content.filter(
       (part): part is { type: string; text: string } =>
         Boolean(part) && typeof part === "object" && (part as { type?: string }).type === "text",
     )
-    return texts.length > 0 && texts.every((part) => typeof part.text === "string" && part.text.startsWith(prefix))
+    return texts.length > 0 && texts.every((part) => matches(part.text))
   }
   return false
 }
 
-// 出站请求体净化: 剥掉尾部"轮次标记"映射出的 user 消息, 让第 2+ 轮请求与原始
-// turn 字节级一致。只认标记文本前缀, 不按"空"判定(空 user 可能是用户真的发了 "")。
+// 出站请求体净化: 剥掉"标记"映射出的 user 消息(轮次标记 / 心跳标记), 任意位置都剥,
+// 让请求里不出现任何内部标记。只认标记文本前缀, 不按"空"判定(空 user 可能是用户真的发了 "")。
 // 返回新数组; 无需剥离时返回 null(调用方保持原请求不动)。
-export function stripTrailingMarkerUsers(
+export function stripMarkerUsers(
   messages: ReadonlyArray<{ role?: string; content?: unknown }>,
-  prefix: string = MARKER_TEXT_PREFIX,
+  prefixes: string | readonly string[] = MARKER_TEXT_PREFIXES,
 ): unknown[] | null {
-  const out = [...messages]
-  let changed = false
-  while (out.length > 0) {
-    const last = out[out.length - 1] as { role?: string; content?: unknown }
-    if (!last || last.role !== "user" || !isMarkerText(last.content, prefix)) break
-    out.pop()
-    changed = true
-  }
-  return changed ? out : null
+  const out = messages.filter(
+    (message) => !(message && message.role === "user" && isMarkerText(message.content, prefixes)),
+  )
+  return out.length === messages.length ? null : out
 }
 
 // ── provider 凭据读取(opencode.db credential 表, 参考 OpenChamber credential-db.js) ──
