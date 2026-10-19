@@ -228,13 +228,13 @@ describe("stripMarkerUsers(出口净化: 任意位置、前缀+随机 token 形�
     expect(stripMarkerUsers([{ role: "user", content: `${MARKER_TEXT_PREFIX}abc` }])).toBeNull()
   })
 
-  test("兼容旧前缀(已部署版本发出过的标记)", () => {
+  test("旧前缀不再剥离(只认新前缀)", () => {
     const legacy = [
       { role: "user", content: "quota-retry-round-ab12cd34" },
       { role: "user", content: "quota-retry-round--hb-ab12cd34" },
       { role: "user", content: "quota-retry-heartbeat-ab12cd34" },
     ]
-    expect(stripMarkerUsers([{ role: "user", content: "hi" }, ...legacy])!.length).toBe(1)
+    expect(stripMarkerUsers([{ role: "user", content: "hi" }, ...legacy])).toBeNull()
   })
 
   test("空 user 不再被剥(空可能是用户真的发了空串)", () => {
