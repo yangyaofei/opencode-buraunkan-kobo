@@ -474,6 +474,7 @@ export default Plugin.define({
                 id: `${MESSAGE_ID_PREFIX}-status-${Date.now().toString(36)}` as any,
                 description: `quota-retry · status (${[...expanded.keys()].length} providers)`,
                 text: statusReport(sessionID),
+                resume: false,
               })
               .pipe(Effect.asVoid, Effect.catch(() => Effect.void))
           }),

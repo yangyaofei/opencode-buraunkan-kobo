@@ -87,6 +87,8 @@ export default {
         id: `msg_session-reaper-reply-${Date.now().toString(36)}` as any,
         description: `session-reaper · ${label}`,
         text,
+        // 只显示给用户, 不唤醒模型(命令回复不需要模型回合; 对齐 1.x noReply:true 的语义)
+        resume: false,
       })
     }
 
