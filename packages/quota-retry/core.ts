@@ -185,18 +185,9 @@ export async function zhipuResetAtMs(
 export const MARKER_TEXT_PREFIX = "EL-PSY-CONGROO-quota-retry-round-"
 // 心跳标记的前缀(与轮次标记分开命名, 语义各归各的)
 export const HEARTBEAT_TEXT_PREFIX = "EL-PSY-CONGROO-quota-retry-heartbeat-"
-// 历史前缀: 已部署版本发出过的标记, 出口继续认(升级后旧会话里的标记也剥得掉)
-export const LEGACY_MARKER_TEXT_PREFIXES = [
-  "quota-retry-round-", // 旧轮次前缀(含更早的心跳形如 quota-retry-round--hb-*)
-  "quota-retry-round--hb-",
-  "quota-retry-heartbeat-", // a7710e7 起的旧心跳前缀
-] as const
-// 出口净化认识的全部标记前缀(任意位置; 只认"前缀 + 随机 token"的完整形状)
-export const MARKER_TEXT_PREFIXES = [
-  MARKER_TEXT_PREFIX,
-  HEARTBEAT_TEXT_PREFIX,
-  ...LEGACY_MARKER_TEXT_PREFIXES,
-] as const
+// 出口净化认识的全部标记前缀(任意位置; 只认"前缀 + 随机 token"的完整形状)。
+// 旧前缀(quota-retry-round-* / quota-retry-heartbeat-*)不再兼容: 旧标记数量少, 用户确认可不管。
+export const MARKER_TEXT_PREFIXES = [MARKER_TEXT_PREFIX, HEARTBEAT_TEXT_PREFIX] as const
 
 // 续命默认可续的错误类型 = opencode 原生 isRetryable 的那一组
 // (RateLimit/ProviderInternal/Transport/InvalidProviderOutput/UnknownProvider + 插件翻转的 Quota)
