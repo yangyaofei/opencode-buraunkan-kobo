@@ -27,7 +27,6 @@
 //   ✅ 长等待心跳(等待期间定期落 durable 标记, 刷新 opencode location 的 60 分钟不活动 TTL)
 //   ❌ on-demand 降级链: 已移除(2.0 无模型路由能力; 见 issue #2)
 
-import { appendFileSync, mkdirSync } from "node:fs"
 import {
   computeWaitMs,
   expandProviders,
@@ -47,6 +46,7 @@ import {
   type ProviderConfig,
 } from "./core"
 import { loadConfig } from "./config"
+import { appendLogLine, defaultLogFile } from "./log"
 
 // 只声明本插件用到的 Context 子集, 避免仓库内安装 @opencode/plugin 依赖。
 type Ctx = {
@@ -65,15 +65,15 @@ type Ctx = {
 }
 
 const MARKER_PREFIX = "quota-retry"
-const DEBUG_LOG = "/tmp/quota-retry-debug.log"
+
+// 运行日志(默认常开): 出事时能直接看到每个 hook 收到了什么、判定结果与算出的等待。
+// 路径 ~/.cache/opencode/buraunkan/quota-retry.log; 可用配置 logFile 覆盖或 false 关闭。
+let LOG_FILE: string | null = null
 
 function dbg(...a: any[]) {
-  if (process.env.QUOTA_RETRY_DEBUG !== "1") return
+  if (!LOG_FILE) return
   const line = a.map((x) => (typeof x === "string" ? x : JSON.stringify(x))).join(" ")
-  try {
-    mkdirSync("/tmp", { recursive: true })
-    appendFileSync(DEBUG_LOG, new Date().toISOString().slice(11, 19) + " " + line + "\n")
-  } catch {}
+  appendLogLine(LOG_FILE, line)
 }
 
 function providerIdsOf(records: ReadonlyArray<any>): string[] {
@@ -97,6 +97,7 @@ export default {
   setup: async (ctx: Ctx) => {
     const projectDir = ctx.location?.directory ?? process.cwd()
     const cfg = loadConfig(projectDir)
+    LOG_FILE = cfg.logFile === false ? null : String(cfg.logFile ?? defaultLogFile())
     const quotaCacheMs = cfg.quotaCacheMs ?? DEFAULT_QUOTA_CACHE_MS
     const maxRounds = cfg.maxRounds ?? Number(process.env.QUOTA_RETRY_MAX_ROUNDS ?? -1)
 
@@ -214,13 +215,16 @@ export default {
       try {
         const providerID = String(evt?.model?.providerID ?? "")
         const p = expanded.get(providerID)
-        const statuses = p?.statuses ?? DEFAULT_QUOTA_STATUSES
         const status = Number(evt?.response?.status)
+        // 配置过的 provider: 每个响应记一行(用来回答"第一次失败到底收到了什么")
+        if (p) dbg("[resp]", providerID, status, evt?.kind)
+        const statuses = p?.statuses ?? DEFAULT_QUOTA_STATUSES
         if (!Number.isFinite(status) || !statuses.includes(status)) return
         dbg("[resp-hook] quota-status:", providerID, status, evt?.kind)
         try {
           const text = await evt.response.clone().text()
           recent429.set(String(evt.sessionID), { at: Date.now(), status, text })
+          dbg("[resp-hook] captured:", text.slice(0, 160))
         } catch (err) {
           dbg("[resp-hook] clone/text err:", String(err))
         }
@@ -248,7 +252,21 @@ export default {
       const byResponse = captured ? isQuotaResponse(captured.status, captured.text, p) : false
       // ② 兜底: 没抓到响应时用 opencode 归纳出的错误(type == provider.quota 或文案命中正则)。
       const byError = !byResponse && isQuotaError(type, message, p?.quotaMatch)
-      if (!byResponse && !byError) return
+      if (!byResponse && !byError) {
+        dbg(
+          "[decision] pass:",
+          providerID,
+          "errStatus=",
+          String(evt?.error?.status ?? ""),
+          "captured=",
+          captured ? captured.status : "none",
+          "type=",
+          String(type ?? ""),
+          "msg=",
+          message.slice(0, 80),
+        )
+        return
+      }
 
       quotaHit.add(sessionID)
       const now = Date.now()
@@ -268,6 +286,9 @@ export default {
       const delay = computeWaitMs({ now, resetAtMs, bufferMs: p?.bufferMs, fallbackWaitMs: p?.fallbackWaitMs })
       evt.decision = { retry: true, delay }
       armHeartbeat(sessionID, delay)
+      dbg(
+        `[decision] engage: attempt=${evt?.attempt} via=${byResponse ? "response" : "error"} delayMs=${delay} (${humanWait(delay)}) resetAtMs=${resetAtMs}`,
+      )
       console.log(
         `[quota-retry] ${providerID} 配额耗尽(attempt=${evt?.attempt}, via=${byResponse ? "response" : "error"}), ${humanWait(delay)}后重试`,
       )
