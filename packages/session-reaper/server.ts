@@ -153,6 +153,8 @@ export default {
             await ctx.session.prompt({
               sessionID,
               text: parsed.prompt,
+              // 这是真正的任务输入, 必须唤醒模型
+              resume: true,
               files: input?.prompt?.files,
               agents: input?.prompt?.agents,
               skills: input?.prompt?.skills,

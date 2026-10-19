@@ -335,6 +335,8 @@ export default Plugin.define({
             id: markerID as any,
             text: markerText,
             description: `${MARKER_PREFIX} round · 第 ${round} 轮`,
+            // 必须唤醒: 这条标记就是下一轮的驱动(新执行 -> 全新 10 次原生重试)
+            resume: true,
           })
           .pipe(
             Effect.tap(() =>
