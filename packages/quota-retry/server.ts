@@ -46,14 +46,14 @@ import {
   needsHeartbeat,
   parseResetAtMs,
   shouldContinue,
-  stripMarkerUsers,
   zhipuResetAtMs,
   DEFAULT_QUOTA_CACHE_MS,
   DEFAULT_HEARTBEAT_MS,
   DEFAULT_QUOTA_STATUSES,
   HEARTBEAT_TEXT_PREFIX,
   MARKER_TEXT_PREFIX,
-  MARKER_TEXT_PREFIXES,
+  MESSAGE_ID_PREFIX,
+  isPluginMessageId,
   type PluginConfig,
   type ProviderConfig,
 } from "./core"
@@ -146,7 +146,7 @@ export default Plugin.define({
       return ctx.session
         .synthetic({
           sessionID: sid as any,
-          id: `msg_${MARKER_PREFIX}-heartbeat-${now.toString(36)}-${Math.random().toString(36).slice(2, 8)}` as any,
+          id: `${MESSAGE_ID_PREFIX}-heartbeat-${now.toString(36)}-${Math.random().toString(36).slice(2, 8)}` as any,
           text: `${HEARTBEAT_TEXT_PREFIX}${Math.random().toString(36).slice(2, 10)}`,
           description: `${MARKER_PREFIX} heartbeat · 内部标记(不发给模型)`,
           resume: false,
@@ -212,27 +212,31 @@ export default Plugin.define({
         const auth = req.headers.get("authorization")
         if (auth) authCache.set(providerID, auth.replace(/^Bearer\s+/i, ""))
       }
-      if (req.method === "POST") {
-        const body: any = await req.clone().json().catch(() => null)
-        if (body && Array.isArray(body.messages) && body.messages.length > 0) {
-          const stripped = stripMarkerUsers(body.messages, MARKER_TEXT_PREFIXES)
-          if (stripped) {
-            const headers = new Headers(req.headers)
-            headers.delete("content-length")
-            evt.request = new Request(req, {
-              method: "POST",
-              headers,
-              body: JSON.stringify({ ...body, messages: stripped }),
-            })
-          }
-        }
-      }
     }
     yield* ctx.session.hook("http.request", (evt) =>
       runAsync(
         () => onHttpRequest(evt),
         (err) => dbg("[strip] error:", String(err)),
       ),
+    )
+
+    // ── 部件 0: 请求构造期按 id 剥除本插件自建的消息(标记/回复) ──
+    // synthetic 在请求里会变成 user 消息; 在 context hook(HTTP 序列化之前)按 id 前缀整段丢掉,
+    // 模型永远看不到轮次标记/心跳/retry-setting 回复。旧实现的 id 同前缀, 一并覆盖。
+    yield* ctx.session.hook("context", (evt: any) =>
+      Effect.sync(() => {
+        try {
+          if (!Array.isArray(evt?.messages)) return
+          const kept = evt.messages.filter((m: any) => !isPluginMessageId(m?.id))
+          const removed = evt.messages.length - kept.length
+          if (removed > 0) {
+            evt.messages = kept
+            dbg("[context] stripped:", removed)
+          }
+        } catch (err) {
+          dbg("[context] ERROR:", String(err))
+        }
+      }),
     )
 
     // ── 部件 1a 前置: 续命期间压制 title 重生成(标记驱动的新执行会触发它, 浪费一次请求) ──
@@ -323,7 +327,7 @@ export default Plugin.define({
       Effect.gen(function* () {
         // 标记 text = 前缀 + 随机 token: 出口按前缀精确剥掉(不靠"空"判定),
         // description 前台可见, id 自指定便于定位。
-        const markerID = `msg_${MARKER_PREFIX}_r${round}_${Date.now().toString(36)}`
+        const markerID = `${MESSAGE_ID_PREFIX}-round-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
         const markerText = `${MARKER_TEXT_PREFIX}${Math.random().toString(36).slice(2, 10)}`
         yield* ctx.session
           .synthetic({
@@ -465,7 +469,11 @@ export default Plugin.define({
             const sessionID = String(input?.sessionID ?? "")
             if (!sessionID) return
             yield* ctx.session
-              .synthetic({ sessionID: sessionID as any, text: statusReport(sessionID) })
+              .synthetic({
+                sessionID: sessionID as any,
+                id: `${MESSAGE_ID_PREFIX}-status-${Date.now().toString(36)}` as any,
+                text: statusReport(sessionID),
+              })
               .pipe(Effect.asVoid, Effect.catch(() => Effect.void))
           }),
       })

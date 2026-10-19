@@ -185,9 +185,6 @@ export async function zhipuResetAtMs(
 export const MARKER_TEXT_PREFIX = "EL-PSY-CONGROO-quota-retry-round-"
 // 心跳标记的前缀(与轮次标记分开命名, 语义各归各的)
 export const HEARTBEAT_TEXT_PREFIX = "EL-PSY-CONGROO-quota-retry-heartbeat-"
-// 出口净化认识的全部标记前缀(任意位置; 只认"前缀 + 随机 token"的完整形状)。
-// 旧前缀(quota-retry-round-* / quota-retry-heartbeat-*)不再兼容: 旧标记数量少, 用户确认可不管。
-export const MARKER_TEXT_PREFIXES = [MARKER_TEXT_PREFIX, HEARTBEAT_TEXT_PREFIX] as const
 
 // 续命默认可续的错误类型 = opencode 原生 isRetryable 的那一组
 // (RateLimit/ProviderInternal/Transport/InvalidProviderOutput/UnknownProvider + 插件翻转的 Quota)
@@ -234,42 +231,15 @@ export function shouldContinue(
   return false
 }
 
-// 判定一条 content 是不是本插件注入的标记: 字符串直接看前缀; parts 形态要求
-// 全部文本 part 都带前缀(避免把用户真实消息误判为标记)。
-export function isMarkerText(
-  content: unknown,
-  prefixes: string | readonly string[] = MARKER_TEXT_PREFIXES,
-): boolean {
-  const list = typeof prefixes === "string" ? [prefixes] : prefixes
-  // 标记的完整形状 = 前缀 + 纯随机 token(小写字母/数字)。带任何后续文字的真实用户消息不匹配。
-  const matches = (text: unknown) =>
-    typeof text === "string" &&
-    list.some(
-      (prefix) =>
-        text.startsWith(prefix) && /^[a-z0-9]{6,}$/.test(text.slice(prefix.length)),
-    )
-  if (typeof content === "string") return matches(content)
-  if (Array.isArray(content)) {
-    const texts = content.filter(
-      (part): part is { type: string; text: string } =>
-        Boolean(part) && typeof part === "object" && (part as { type?: string }).type === "text",
-    )
-    return texts.length > 0 && texts.every((part) => matches(part.text))
-  }
-  return false
-}
+// 本插件自建消息的 id 前缀: 轮次标记 / 心跳标记 / retry-setting 回复 都用它,
+// 在 context hook 里按 id 整段剥除(HTTP 序列化之前), 请求里不会出现这些消息。
+// 旧实现的 id(msg_quota-retry_rN_* / msg_quota-retry-heartbeat-* / msg_quota-retry-round-_hb_*)
+// 同前缀, 一并覆盖。注: opencode 的消息 id 必须以 "msg_" 开头, 所以首个下划线保留, 其余分隔用中划线。
+export const MESSAGE_ID_PREFIX = "msg_quota-retry"
 
-// 出站请求体净化: 剥掉"标记"映射出的 user 消息(轮次标记 / 心跳标记), 任意位置都剥,
-// 让请求里不出现任何内部标记。只认标记文本前缀, 不按"空"判定(空 user 可能是用户真的发了 "")。
-// 返回新数组; 无需剥离时返回 null(调用方保持原请求不动)。
-export function stripMarkerUsers(
-  messages: ReadonlyArray<{ role?: string; content?: unknown }>,
-  prefixes: string | readonly string[] = MARKER_TEXT_PREFIXES,
-): unknown[] | null {
-  const out = messages.filter(
-    (message) => !(message && message.role === "user" && isMarkerText(message.content, prefixes)),
-  )
-  return out.length === messages.length ? null : out
+export function isPluginMessageId(id: unknown): boolean {
+  // 必须带分隔符边界: msg_quota-retry-*(新) / msg_quota-retry_*(旧)
+  return typeof id === "string" && /^msg_quota-retry[-_]/.test(id)
 }
 
 // ── provider 凭据读取(opencode.db credential 表, 参考 OpenChamber credential-db.js) ──

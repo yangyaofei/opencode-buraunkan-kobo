@@ -80,8 +80,20 @@ export default {
       // 注意: 同一 session 首条之后 runner 可能不再主动消费 inbox(2.0.15 平台行为),
       // 后续回复滞留 /api/session/:id/inbox, 该 session 下次 agent loop 运行时显示
       // —— 见 README "已知限制"
-      await ctx.session.synthetic({ sessionID, text })
+      // id 自指定: 这些回复属于本插件, 在 context hook 里按 id 剥掉, 不进入模型请求。
+      await ctx.session.synthetic({
+        sessionID,
+        id: `msg_session-reaper-reply-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}` as any,
+        text,
+      })
     }
+
+    // 请求构造期按 id 剥除本插件的命令回复(synthetic 在请求里会变成 user 消息)。
+    await ctx.session.hook("context", async (evt: any) => {
+      if (!Array.isArray(evt?.messages)) return
+      const kept = evt.messages.filter((m: any) => !(typeof m?.id === "string" && m.id.startsWith("msg_session-reaper-")))
+      if (kept.length !== evt.messages.length) evt.messages = kept
+    })
 
     await ctx.command.transform((editor) => {
       editor.add({
