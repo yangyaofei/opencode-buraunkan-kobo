@@ -39,6 +39,10 @@ export type ContinuePolicy = {
 export type PluginConfig = {
   providers?: ProviderConfig[]
   quotaCacheMs?: number
+  // 运行日志文件。缺省 = ~/.cache/opencode/buraunkan/quota-retry.log(常开, 512KB 上限自动截断);
+  // 传字符串 = 自定义路径; 传 false = 关闭。日志记录每个 hook 收到的内容、判定结果与等待,
+  // 用于事后定位("第一次失败为什么没被识别为配额"这类问题)。
+  logFile?: string | false
   // 轮次续命的轮数上限; -1 = 不限(默认)。每轮 = 原生 10 次重试。
   maxRounds?: number
   // 续命触发策略(默认: 可重试错误类型 + 429/5xx)。
