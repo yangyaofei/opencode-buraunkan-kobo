@@ -32,7 +32,7 @@
 //   ✅ 无限次数(轮次续命, 每轮原生 10 次; 1.x 靠二进制补丁, 2.0 出货二进制核心
 //      chunk 是 JSC bytecode, 明文补丁无效 — 已实验证明)
 //   ✅ TUI 可见性(原生徽标 + 每轮覆写的通知行 "quota-retry · 第 N 轮")
-//   ✅ quota_retry_status 工具 / retry-setting 命令(零模型回复)
+//   ✅ quota-retry-status 工具 / retry-setting 命令(零模型回复)
 //   ✅ 长等待心跳(插件自己的定时 fiber, 框架原语, 不依赖宿主事件)
 //   ❌ on-demand 降级链: 已移除(2.0 无模型路由能力; 见 issue #2)
 
@@ -448,7 +448,7 @@ export default Plugin.define({
 
     yield* ctx.tool.transform((editor) => {
       editor.add({
-        name: "quota_retry_status",
+        name: "quota-retry-status",
         description: "读取 quota-retry 配置与匹配到的 provider(只读, 无副作用)。",
         input: Schema.Struct({}),
         execute: () =>

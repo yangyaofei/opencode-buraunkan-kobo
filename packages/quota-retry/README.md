@@ -27,7 +27,7 @@
 - **出口净化**：`context` hook（HTTP 序列化之前）按消息 **id 前缀 `msg_quota-retry`** 整段丢掉本插件自建的消息（轮次标记 / 心跳 / `retry-setting` 回复——回复带 `description`，界面显示成一行通知；旧实现的 id `msg_quota-retry_*` / `msg_quota-retry-heartbeat-*` 同前缀，一并覆盖）。确定性匹配、不依赖文本内容，**不会误删真实用户消息**；第 2+ 轮请求与原始 turn 字节级一致（Docker 实测 45 次 429 全程同 hash）。
 - **运行日志（默认关闭，排查时开）**：配置 `logFile: true` 打开（默认路径 `~/.cache/opencode/buraunkan/quota-retry.log`，512KB 上限自动截断），或给自定义路径；缺省 / `false` = 关闭。只记关键决策：判定命中与算出的等待、心跳发送/失败、加载/卸载与错误 —— 用于事后定位"等待为什么没撑住"这类问题。
 - 用户接管：续命过程中用户发新消息自动停止续命让位。
-- `quota_retry_status` 工具 + `/retry-setting` 命令（`ctx.session.synthetic` 零模型回复）。
+- `quota-retry-status` 工具 + `/retry-setting` 命令（`ctx.session.synthetic` 零模型回复）。
 
 ## 与 1.x 的差异
 

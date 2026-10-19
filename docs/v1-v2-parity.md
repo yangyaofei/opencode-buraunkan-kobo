@@ -20,7 +20,7 @@
 | 6 | 无头退避封顶 `backoffCapMs` | 补丁改常量（V1 起因：无 retry-after 头时指数退避无限翻倍，实测 38s→76s 一路加倍） | 未移植 | **无需移植**：2.0 原生 schedule 是 `exponential('2s') ∩ spaced('10s')`，单跳退避天然封顶 10s，"无限翻倍"在 2.0 不存在 |
 | 7 | on-demand 虚模型降级链 | fetch 注入层逐跳改写 `body.model` 跨 provider 转发 + 换鉴权 + 挂载组自动创建 | **已移除** | 2.0 无模型路由能力（`model.request` 的 `model` 只读、`retry` 决策不含换模型、aisdk hook 对 promise 插件不触发）；原绕路（config stub + `http.request` 改写）已删除，见 §4-G2 与 issue #2 |
 | 8 | `/retry-setting` 查询 | `command.execute.before` 本地接管 + reply 哨兵（ignored 消息） | `command.transform` 注册 + `session.synthetic` 零模型回复 | **等价**。V2 用原生命令机制更干净。V1 报告里的"补丁二进制实际值对照"部分在 V2 无对应物（无补丁，N/A），改为轮次语义说明 |
-| 9 | `quota_retry_status` 工具 | registerTool | `tool.transform` | **等价**（新增当前会话轮次显示） |
+| 9 | `quota-retry-status` 工具 | registerTool | `tool.transform` | **等价**（新增当前会话轮次显示） |
 | 10 | TUI 可见性 | 无专门处理（原生徽标 + 补丁后次数连续） | 原生徽标（attempt + 倒计时）每轮重置 + 每轮覆写的通知行"quota-retry · 第 N 轮" | **V2 更好**（V1 徽标只在前 5/10 次出现）；差别：V2 每轮 attempt 从头计（1.5 轮语义），V1 连续计数 |
 | 11 | 插件自更新 | shared/sync 节流检查 + 删 wrapper 让 opencode 原生补装 | 未移植 | **缺口**，见 §4-G4 |
 | 12 | （新）用户接管 | 无此概念（补丁常驻，用户发消息即新 step 天然接管） | 续命中检测到新用户输入自动停止续命让位 | V2 新增，语义正确（初始 prompt 的入队不算接管） |
