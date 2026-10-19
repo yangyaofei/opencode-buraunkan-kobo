@@ -8,7 +8,7 @@ import {
   needsHeartbeat,
   parseResetAtMs,
   readProviderApiKeys,
-  stripTrailingMarkerUsers,
+  stripMarkerUsers,
   shouldContinue,
   type PluginConfig,
   xdgDataDir,
@@ -175,47 +175,76 @@ describe("端到端(body 场景)", () => {
   })
 })
 
-describe("stripTrailingMarkerUsers(出口净化)", () => {
-  test("剥掉尾部的前缀标记 user(字符串形态)", () => {
+describe("stripMarkerUsers(出口净化: 任意位置、按前缀)", () => {
+  test("剥掉任意位置的标记 user(字符串形态)", () => {
     const msgs = [
       { role: "user", content: "hi" },
       { role: "assistant", content: "done" },
       { role: "user", content: "quota-retry-round-ab12cd34" },
     ]
-    const out = stripTrailingMarkerUsers(msgs)!
+    const out = stripMarkerUsers(msgs)!
     expect(out.length).toBe(2)
     expect((out[1] as any).role).toBe("assistant")
   })
 
-  test("剥掉多个连续标记 user(含 parts 形态)", () => {
+  test("中间的标记也要剥(标记后面还有真实内容: 心跳标记的典型场景)", () => {
+    const msgs = [
+      { role: "user", content: "hi" },
+      { role: "assistant", content: "attempt failed" },
+      { role: "user", content: "quota-retry-heartbeat-x1" }, // 等待期间的心跳标记
+      { role: "assistant", content: "resumed and wrote real content" }, // 等待结束后模型继续
+      { role: "user", content: "next turn" },
+    ]
+    const out = stripMarkerUsers(msgs)!
+    expect(out.length).toBe(4)
+    expect(out.map((m: any) => m.content)).toEqual(["hi", "attempt failed", "resumed and wrote real content", "next turn"])
+  })
+
+  test("多轮累积: 两轮各 10 条标记 + 真实内容 → 标记全剥、内容全留", () => {
+    const round = (n: number) => Array.from({ length: 10 }, (_, i) => ({ role: "user", content: `quota-retry-round-r${n}-${i}` }))
+    const msgs = [
+      { role: "user", content: "hi" },
+      ...round(1),
+      { role: "assistant", content: "content after round 1" },
+      ...round(2),
+      { role: "assistant", content: "content after round 2" },
+    ]
+    const out = stripMarkerUsers(msgs)!
+    expect(out.length).toBe(3)
+    expect(out.map((m: any) => m.content)).toEqual(["hi", "content after round 1", "content after round 2"])
+  })
+
+  test("两个前缀都认(round + heartbeat), 含 parts 形态", () => {
     const msgs = [
       { role: "user", content: "hi" },
       { role: "user", content: [{ type: "text", text: "quota-retry-round-x1" }] },
-      { role: "user", content: "quota-retry-round-x2" },
+      { role: "user", content: "quota-retry-heartbeat-x2" },
+      { role: "user", content: [{ type: "text", text: "quota-retry-heartbeat-x3" }] },
     ]
-    expect(stripTrailingMarkerUsers(msgs)!.length).toBe(1)
+    expect(stripMarkerUsers(msgs)!.length).toBe(1)
   })
 
   test("空 user 不再被剥(空可能是用户真的发了空串)", () => {
-    expect(stripTrailingMarkerUsers([{ role: "user", content: "" }])).toBeNull()
-    expect(stripTrailingMarkerUsers([{ role: "user", content: [] }])).toBeNull()
+    expect(stripMarkerUsers([{ role: "user", content: "" }])).toBeNull()
+    expect(stripMarkerUsers([{ role: "user", content: [] }])).toBeNull()
   })
 
   test("不误伤: 普通消息/assistant/带前缀但不匹配的 parts 返回 null", () => {
-    expect(stripTrailingMarkerUsers([{ role: "user", content: "hi" }])).toBeNull()
-    expect(stripTrailingMarkerUsers([{ role: "assistant", content: "quota-retry-round-x" }])).toBeNull()
-    expect(stripTrailingMarkerUsers([{ role: "user", content: [{ type: "text", text: "hi" }] }])).toBeNull()
+    expect(stripMarkerUsers([{ role: "user", content: "hi" }])).toBeNull()
+    expect(stripMarkerUsers([{ role: "assistant", content: "quota-retry-round-x" }])).toBeNull()
+    expect(stripMarkerUsers([{ role: "user", content: [{ type: "text", text: "hi" }] }])).toBeNull()
     // parts 里混有普通文本 → 不算标记
     expect(
-      stripTrailingMarkerUsers([
+      stripMarkerUsers([
         { role: "user", content: [{ type: "text", text: "quota-retry-round-x" }, { type: "text", text: "hi" }] },
       ]),
     ).toBeNull()
   })
 
   test("自定义前缀生效", () => {
-    expect(stripTrailingMarkerUsers([{ role: "user", content: "xyz-1" }], "xyz-")!.length).toBe(0)
-    expect(stripTrailingMarkerUsers([{ role: "user", content: "xyz-1" }], "abc-")).toBeNull()
+    expect(stripMarkerUsers([{ role: "user", content: "xyz-1" }], "xyz-")!.length).toBe(0)
+    expect(stripMarkerUsers([{ role: "user", content: "xyz-1" }], "abc-")).toBeNull()
+    expect(stripMarkerUsers([{ role: "user", content: "xyz-1" }], ["abc-", "xyz-"])!.length).toBe(0)
   })
 })
 

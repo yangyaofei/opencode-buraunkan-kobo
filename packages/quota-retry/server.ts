@@ -46,12 +46,14 @@ import {
   needsHeartbeat,
   parseResetAtMs,
   shouldContinue,
-  stripTrailingMarkerUsers,
+  stripMarkerUsers,
   zhipuResetAtMs,
   DEFAULT_QUOTA_CACHE_MS,
   DEFAULT_HEARTBEAT_MS,
   DEFAULT_QUOTA_STATUSES,
+  HEARTBEAT_TEXT_PREFIX,
   MARKER_TEXT_PREFIX,
+  MARKER_TEXT_PREFIXES,
   type PluginConfig,
   type ProviderConfig,
 } from "./core"
@@ -144,8 +146,8 @@ export default Plugin.define({
       return ctx.session
         .synthetic({
           sessionID: sid as any,
-          id: `msg_${MARKER_TEXT_PREFIX}_hb_${now.toString(36)}_${Math.random().toString(36).slice(2, 8)}` as any,
-          text: `${MARKER_TEXT_PREFIX}-hb-${Math.random().toString(36).slice(2, 10)}`,
+          id: `msg_${HEARTBEAT_TEXT_PREFIX}${now.toString(36)}-${Math.random().toString(36).slice(2, 8)}` as any,
+          text: `${HEARTBEAT_TEXT_PREFIX}${Math.random().toString(36).slice(2, 10)}`,
           description: `${MARKER_TEXT_PREFIX} · 等待心跳 · 内部标记(不发给模型)`,
           resume: false,
         })
@@ -213,7 +215,7 @@ export default Plugin.define({
       if (req.method === "POST") {
         const body: any = await req.clone().json().catch(() => null)
         if (body && Array.isArray(body.messages) && body.messages.length > 0) {
-          const stripped = stripTrailingMarkerUsers(body.messages, MARKER_TEXT_PREFIX)
+          const stripped = stripMarkerUsers(body.messages, MARKER_TEXT_PREFIXES)
           if (stripped) {
             const headers = new Headers(req.headers)
             headers.delete("content-length")
