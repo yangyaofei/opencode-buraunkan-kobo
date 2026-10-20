@@ -403,7 +403,9 @@ export default Plugin.define({
                 }),
               ),
             )
-          sessionDir = info?.directory === undefined ? undefined : String(info.directory)
+          // Session.Info 没有顶层 directory —— 目录在 info.location.directory
+          const rawDir = (info as any)?.location?.directory
+          sessionDir = rawDir === undefined || rawDir === null ? undefined : String(rawDir)
           if (sessionDir === undefined) dbg("[owner] session lookup failed:", sid, type)
         }
         if (resolveEventOwner(evLoc, selfDir, sessionDir) === "skip") {
