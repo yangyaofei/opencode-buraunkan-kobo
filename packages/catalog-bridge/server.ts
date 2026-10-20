@@ -14,6 +14,7 @@ import {
   findModelMeta,
   loadCatalogSync,
   mergePriority,
+  mirrorMeta,
   refreshCatalog,
   type Catalog,
   type CatalogModel,
@@ -22,8 +23,9 @@ import { loadConfig } from "./config"
 
 type Ctx = {
   location?: { directory?: string }
+  event: { subscribe: () => AsyncIterable<any> }
   model: {
-    transform: (cb: (editor: ModelEditor) => void) => Promise<unknown>
+    transform: (cb: (editor: ModelEditor) => void) => Promise<{ dispose: () => Promise<void> }>
     reload: () => Promise<unknown>
   }
 }
@@ -51,6 +53,16 @@ export default {
       console.log(`[catalog-bridge] 优先 provider: ${priority.join(" > ")}`)
     }
 
+    // 按优先级找"平台已播种好的源 model 记录"(如 deepseek/deepseek-flash)。
+    // 只读注册表, 不要求该 provider 被配置/可用, 也不发任何请求。
+    const findSource = (editor: ModelEditor, modelID: string): any => {
+      for (const pid of priority) {
+        const found = editor.list(pid).find((m) => String(m.id) === modelID)
+        if (found) return found
+      }
+      return undefined
+    }
+
     const patchAll = (editor: ModelEditor): number => {
       let patched = 0
       try {
@@ -60,10 +72,14 @@ export default {
           if (isCatalogProvider(memory, providerID, def.provider.canonical)) continue
           const pkg = def.provider.package
           for (const model of editor.list(providerID)) {
-            const meta = findModelMeta(memory, model.id, priority)
-            if (!meta) continue
+            const source = findSource(editor, String(model.id))
+            const meta = source ? null : findModelMeta(memory, model.id, priority)
+            if (!source && !meta) continue
             const before = JSON.stringify(model)
-            editor.update(providerID, model.id, (draft) => applyMeta(draft, meta as CatalogModel, pkg))
+            editor.update(providerID, model.id, (draft) => {
+              if (source) mirrorMeta(draft, source)
+              else applyMeta(draft, meta as CatalogModel, pkg)
+            })
             patched += JSON.stringify(model) !== before ? 1 : 0
           }
         }
@@ -73,10 +89,39 @@ export default {
       return patched
     }
 
-    await ctx.model.transform((editor) => {
-      const n = patchAll(editor)
-      if (n > 0) console.log(`[catalog-bridge] 补全 ${n} 个自定义 provider 模型的元数据`)
-    })
+    let registration: { dispose: () => Promise<void> } | undefined
+    const register = async () => {
+      registration = await ctx.model.transform((editor) => {
+        const n = patchAll(editor)
+        if (n > 0) console.log(`[catalog-bridge] 补全 ${n} 个自定义 provider 模型的元数据`)
+      })
+    }
+    await register()
+
+    // 启动后补几次重注册: config provider 的晚注册 transform 可能在我们的 setup 之后才注册,
+    // 几次之后顺序就稳定了(之后靠 provider.updated 维持)。
+    const reRegister = async () => {
+      try {
+        await registration?.dispose()
+      } catch {}
+      await register()
+    }
+    const timers = [250, 1200, 4000].map((ms) => setTimeout(() => void reRegister().catch(() => {}), ms))
+
+    // 平台的 config provider 插件会在外部 transform 之后"晚注册"自己的 transform,
+    // 并把 variants 重算成默认值。provider 更新后重新注册, 让我们排在它之后。
+    void (async () => {
+      let last = 0
+      try {
+        for await (const ev of ctx.event.subscribe()) {
+          if (String((ev as any)?.type ?? "") !== "provider.updated") continue
+          const now = Date.now()
+          if (now - last < 1000) continue
+          last = now
+          await reRegister()
+        }
+      } catch {}
+    })()
 
     // 异步刷新 catalog(TTL 过期), 成功后触发重放应用新数据
     void (async () => {
@@ -87,6 +132,8 @@ export default {
       }
     })()
 
-    return () => {}
+    return () => {
+      for (const timer of timers) clearTimeout(timer)
+    }
   },
 }
