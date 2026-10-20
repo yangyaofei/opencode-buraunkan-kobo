@@ -13,12 +13,15 @@ import {
   applyMeta,
   findModelMeta,
   loadCatalogSync,
+  mergePriority,
   refreshCatalog,
   type Catalog,
   type CatalogModel,
 } from "./catalog"
+import { loadConfig } from "./config"
 
 type Ctx = {
+  location?: { directory?: string }
   model: {
     transform: (cb: (editor: ModelEditor) => void) => Promise<unknown>
     reload: () => Promise<unknown>
@@ -42,6 +45,11 @@ export default {
   id: "catalog-bridge",
   setup: async (ctx: Ctx) => {
     let memory: Catalog = loadCatalogSync() ?? {}
+    const cfg = loadConfig(ctx.location?.directory)
+    const priority = mergePriority(cfg.preferredProviders)
+    if (cfg.preferredProviders?.length) {
+      console.log(`[catalog-bridge] 优先 provider: ${priority.join(" > ")}`)
+    }
 
     const patchAll = (editor: ModelEditor): number => {
       let patched = 0
@@ -52,7 +60,7 @@ export default {
           if (isCatalogProvider(memory, providerID, def.provider.canonical)) continue
           const pkg = def.provider.package
           for (const model of editor.list(providerID)) {
-            const meta = findModelMeta(memory, model.id)
+            const meta = findModelMeta(memory, model.id, priority)
             if (!meta) continue
             const before = JSON.stringify(model)
             editor.update(providerID, model.id, (draft) => applyMeta(draft, meta as CatalogModel, pkg))
