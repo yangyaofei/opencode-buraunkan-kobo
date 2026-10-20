@@ -5,7 +5,7 @@ import {
   isQuotaError,
   isQuotaResponse,
   isQuotaText,
-  needsHeartbeat,
+  pickKeepaliveTarget,
   parseResetAtMs,
   readProviderApiKeys,
   isPluginMessageId,
@@ -247,26 +247,42 @@ describe("shouldContinue(续命触发策略)", () => {
 })
 
 
-describe("needsHeartbeat", () => {
-  test("等待长于心跳间隔 → 需要心跳", () => {
-    expect(needsHeartbeat(3 * 3600_000, 2_700_000)).toBe(true)
+describe("pickKeepaliveTarget", () => {
+  test("优先活跃执行中最早的会话", () => {
+    expect(pickKeepaliveTarget(["s2", "s1"], ["s3"])).toBe("s2")
   })
-  test("等待短于心跳间隔 → 不需要(本来就在 TTL 内)", () => {
-    expect(needsHeartbeat(10 * 60_000, 2_700_000)).toBe(false)
-    expect(needsHeartbeat(2_700_000, 2_700_000)).toBe(false)
+  test("无活跃执行时取最早的后台 shell 会话", () => {
+    expect(pickKeepaliveTarget([], ["s3", "s4"])).toBe("s3")
   })
-  test("缺省间隔 = 45 分钟", () => {
+  test("都为空 → undefined(不发送, 不能无端复活已回收的 location)", () => {
+    expect(pickKeepaliveTarget([], [])).toBeUndefined()
+  })
+  test("跳过空串条目", () => {
+    expect(pickKeepaliveTarget(["", "s1"], [])).toBe("s1")
+  })
+  test("缺省间隔常量 = 45 分钟(sweeper 周期, 低于 60 分钟 TTL 留余量)", () => {
     expect(DEFAULT_HEARTBEAT_MS).toBe(45 * 60 * 1000)
-    expect(needsHeartbeat(3 * 3600_000)).toBe(true)
   })
-  test("0 / 负数 / 非有限值 = 关闭心跳", () => {
-    expect(needsHeartbeat(3 * 3600_000, 0)).toBe(false)
-    expect(needsHeartbeat(3 * 3600_000, -1)).toBe(false)
-    expect(needsHeartbeat(3 * 3600_000, Number.NaN)).toBe(false)
+})
+
+describe("resolveEventOwner(事件归属)", () => {
+  const self = "/work/a"
+  test("带信封: 信封是权威(高频 location 级事件走这条快路径)", () => {
+    expect(resolveEventOwner("/work/a", self, undefined)).toBe("match")
+    expect(resolveEventOwner("/work/b", self, undefined)).toBe("skip")
+    // 信封与 session 目录冲突时信封优先(不会被 session 目录"救回来")
+    expect(resolveEventOwner("/work/b", self, "/work/a")).toBe("skip")
   })
-  test("非法等待时长 → 不需要心跳", () => {
-    expect(needsHeartbeat(Number.NaN, 2_700_000)).toBe(false)
-    expect(needsHeartbeat(0, 2_700_000)).toBe(false)
+  test("无信封: 按 session 目录反查(execution.* / usage.updated 的实际形态)", () => {
+    expect(resolveEventOwner("", self, "/work/a")).toBe("match")
+    expect(resolveEventOwner(undefined, self, "/work/b")).toBe("skip")
+  })
+  test("无信封且查不到会话: 丢弃(宁可漏处理, 不可跨 location 重复处理)", () => {
+    expect(resolveEventOwner("", self, undefined)).toBe("skip")
+    expect(resolveEventOwner(undefined, self, "")).toBe("skip")
+  })
+  test("回归: execution.* 无信封不再被一律丢弃(2026-10-20 事故根因)", () => {
+    expect(resolveEventOwner(undefined, "/mnt/media3/project/note", "/mnt/media3/project/note")).toBe("match")
   })
 })
 
