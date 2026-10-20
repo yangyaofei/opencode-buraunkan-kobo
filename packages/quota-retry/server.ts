@@ -395,7 +395,14 @@ export default Plugin.define({
           if (!sid) return // 全局事件(server.connected 等), 与本插件无关
           const info = yield* ctx.session
             .get({ sessionID: sid as any })
-            .pipe(Effect.catch(() => Effect.succeed(undefined as any)))
+            .pipe(
+              Effect.catch((e: any) =>
+                Effect.sync(() => {
+                  dbg("[owner] get error:", String(e?._tag ?? e?.message ?? e).slice(0, 140))
+                  return undefined as any
+                }),
+              ),
+            )
           sessionDir = info?.directory === undefined ? undefined : String(info.directory)
           if (sessionDir === undefined) dbg("[owner] session lookup failed:", sid, type)
         }
