@@ -56,6 +56,7 @@ import {
   MARKER_TEXT_PREFIX,
   MESSAGE_ID_PREFIX,
   isPluginMessageId,
+  resolveEventOwner,
   type PluginConfig,
   type ProviderConfig,
 } from "./core"
@@ -132,6 +133,10 @@ export default Plugin.define({
     const quotaHit = new Set<string>() // retry hook 判定过配额的会话(精确等待来源)
     // sid -> 最近一次失败的错误(原生重试耗尽时判定是否续命, 见 shouldContinue)
     const lastFailure = new Map<string, { type?: string; status?: number; message?: string }>()
+    // sid -> 最近一次失败 step 的 assistantMessageID(续命标记的幂等键, 见 redoRound)
+    const lastFailureMessage = new Map<string, string>()
+    // sid -> 会话目录反查缓存(60s TTL; 无信封事件归属判定用, 见 handleEventInner)
+    const dirCache = new Map<string, { dir: string | undefined; at: number }>()
     // providerID -> 出站 Authorization 头(zhipu 配额查询的 apiKey 回退来源, 对齐 1.x)
     const authCache = new Map<string, string>()
 
@@ -203,6 +208,7 @@ export default Plugin.define({
         stopped.delete(sid)
         quotaHit.delete(sid)
         lastFailure.delete(sid)
+        lastFailureMessage.delete(sid)
         yield* disarmHeartbeat(sid, "succeeded")
       })
 
@@ -333,9 +339,17 @@ export default Plugin.define({
     // 发给模型的请求由出口 strip 保持干净(标记 user 消息剥除)。
     const redoRound = (sessionID: string, round: number) =>
       Effect.gen(function* () {
-        // 标记 text = 前缀 + 随机 token: 出口按前缀精确剥掉(不靠"空"判定),
+        // 标记 text = 前缀 + 随机 token: 出口按 id 前缀剥除(见部件 0), 不靠"空"判定,
         // description 前台可见, id 自指定便于定位。
-        const markerID = `${MESSAGE_ID_PREFIX}-round-${round}-${Date.now().toString(36)}`
+        //
+        // 幂等键 = 失败 step 的 assistantMessageID(每轮失败各不相同, 见 step.failed 分支):
+        //   · 同一次失败在多实例下算出同一个 id, 第二个注入得到冲突
+        //     (synthetic 不是 upsert) → 视为"已被续过", 幂等跳过;
+        //   · 拿不到 assistantMessageID(drain 级失败, 未经 step.failed)→ 退回
+        //     轮次号+时间戳: 宁可多续一次(重复标记代价是多跑一轮), 也不能用可能撞旧标记的
+        //     纯轮次号 —— 那会静默丢续命, 与本插件的存在目的相反。
+        const failureKey = lastFailureMessage.get(sessionID) ?? `r${round}-${Date.now().toString(36)}`
+        const markerID = `${MESSAGE_ID_PREFIX}-round-${sessionID}-${failureKey}`
         const markerText = `${MARKER_TEXT_PREFIX}${Math.random().toString(36).slice(2, 10)}`
         yield* ctx.session
           .synthetic({
@@ -351,7 +365,17 @@ export default Plugin.define({
               Effect.sync(() => console.log(`[quota-retry] ${sessionID} 第 ${round} 轮续命(原生 10 次重试重新计数)`)),
             ),
             Effect.catch((err) =>
-              Effect.sync(() => dbg("[round] synthetic FAIL:", String((err as any)?.message ?? err).slice(0, 140))),
+              Effect.sync(() => {
+                const msg = String((err as any)?.message ?? err)
+                const tag = String((err as any)?._tag ?? "")
+                // 幂等跳过: 同一次失败被第二个实例先续过了(synthetic 同 id 冲突)
+                // 冲突判定 tag 优先(有结构化错误类型时), 文案正则兜底
+                if (/conflict|already exists/i.test(`${tag} ${msg}`)) {
+                  dbg("[round] marker already injected, idempotent skip:", markerID)
+                  return
+                }
+                dbg("[round] synthetic FAIL:", msg.slice(0, 140))
+              }),
             ),
           )
       })
@@ -361,12 +385,52 @@ export default Plugin.define({
       Effect.gen(function* () {
         const type = ev?.type
         const data = ev?.data ?? ev
-        // 事件流是全 location 广播(每个实例都收到): 只处理本实例自己 location 的事件。
-        // 否则同一个会话会被每个实例各处理一遍(重复心跳 / 重复续命 / 重复标记——
-        // 实测 3 个 location 实例 = 3 条重复标记)。会话事件都带 location 信封
-        // (bus.publish 从发布者上下文的 Location.Service 取), 无 location 的全局事件与本插件无关。
+        // 事件流是全 location 广播: 必须先判定归属, 否则同一个会话会被每个实例各处理一遍
+        // (实测 3 个 location 实例 = 3 条重复标记)。归属判据见 core.resolveEventOwner:
+        //   · 有信封(location 级事件, 高频) → 信封是权威, 快路径, 不查库;
+        //   · 无信封(execution.* / usage.updated) → 按 sessionID 反查会话目录。
+        // 不能只比信封: execution.* 不带信封, 只比信封会把续命/清零/disarm 全部静默丢弃
+        // (2026-10-20 事故: 10 次原生重试耗尽后会话直接 failed, 无任何报错)。
         const evLoc = String(ev?.location?.directory ?? "")
-        if (evLoc !== String(ctx.location?.directory ?? "")) return
+        const selfDir = String(ctx.location?.directory ?? "")
+        let sessionDir: string | undefined
+        if (!evLoc) {
+          const sid = String((data as any)?.sessionID ?? "")
+          if (!sid) return // 全局事件(server.connected 等), 与本插件无关
+          // sid→dir 短 TTL 缓存: 事件流是全 location 广播, 无信封事件(execution.*/usage.updated)
+          // 每条都要反查一次 session, 多 location 部署下是热路径; 60s TTL 也兜住 session.move 的陈旧性。
+          const cached = dirCache.get(sid)
+          const fresh = cached && Date.now() - cached.at < 60_000
+          if (fresh) {
+            sessionDir = cached.dir
+          } else {
+            const info = yield* ctx.session
+              .get({ sessionID: sid as any })
+              .pipe(
+                Effect.catch((e: any) =>
+                  Effect.sync(() => {
+                    dbg("[owner] get error:", String(e?._tag ?? e?.message ?? e).slice(0, 140))
+                    return undefined as any
+                  }),
+                ),
+              )
+            // Session.Info 没有顶层 directory —— 目录在 info.location.directory
+            const rawDir = (info as any)?.location?.directory
+            sessionDir = rawDir === undefined || rawDir === null ? undefined : String(rawDir)
+            // 只缓存成功结果: 查询失败(超时/实例刚启动)若是缓存了 undefined, 60s 内到达的
+            // execution.failed(一次性事件, 无重试)会被误判"非本 location"而静默丢续命(#18 review r2)。
+            // 失败不写缓存 → 下一条无信封事件(如 usage.updated)会再查, 等于免费重试。
+            if (sessionDir !== undefined) {
+              if (dirCache.size > 4096) dirCache.clear() // 粗上限: 防按会话数无限增长(插入序无法逐条淘汰, 清空代价可忽略)
+              dirCache.set(sid, { dir: sessionDir, at: Date.now() })
+            }
+          }
+          if (sessionDir === undefined) dbg("[owner] session lookup failed:", sid, type)
+        }
+        if (resolveEventOwner(evLoc, selfDir, sessionDir) === "skip") {
+          if (!evLoc) dbg("[owner] skip by session dir:", sessionDir ?? "<not-found>", "self=", selfDir, type)
+          return
+        }
         if (type === "session.inbox.enqueued" && data?.item?.type === "user") {
           // 用户接管: 仅在本 turn 已处于续命救援中才算接管(初始 prompt 的入队不算,
           // 否则每个 turn 的第一次入队就会把续命全关掉)。
@@ -374,6 +438,14 @@ export default Plugin.define({
             stopped.add(String(data.sessionID))
             console.log(`[quota-retry] ${data.sessionID} 用户接管, 停止续命`)
           }
+          return
+        }
+        if (type === "session.execution.started") {
+          // 新执行开始: 清掉上一 turn 的失败残留 —— 否则本轮若未经 step.failed 直接失败
+          // (drain 级错误), 幂等键会指向旧消息, 撞上旧标记被误判"已续过"而静默不唤醒。
+          const startedSid = String(data.sessionID ?? "")
+          lastFailure.delete(startedSid)
+          lastFailureMessage.delete(startedSid)
           return
         }
         if (type === "session.step.failed") {
@@ -384,6 +456,9 @@ export default Plugin.define({
               status: typeof err.status === "number" ? err.status : undefined,
               message: String(err.message ?? ""),
             })
+            // 记下失败 step 的消息 id: execution.failed 事件里没有它,
+            // 续命标记要用它做幂等键(同一次失败 → 同一个 id)。
+            if (data.assistantMessageID) lastFailureMessage.set(String(data.sessionID), String(data.assistantMessageID))
           }
           return
         }

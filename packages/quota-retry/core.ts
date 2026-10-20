@@ -179,6 +179,34 @@ export async function zhipuResetAtMs(
   }
 }
 
+// ── 事件归属(location 级订阅) ──
+//
+// 宿主的事件流是**全 location 广播**: 每个插件实例都会收到所有 location 的事件
+// (否则多实例会重复续命 / 重复心跳 / 重复标记 —— 实测 3 个 location 实例 = 3 条标记)。
+// 因此每个实例必须先判定"这条事件属于哪个 location"。
+//
+// 坑: 宿主 2.0.32 的事件信封**并不统一**
+//   · location 级事件(step.* / inbox.* / tool.* / retry.scheduled ...) 带 location;
+//   · execution.* / usage.updated 由服务器级执行队列发布(发布点在 location 作用域
+//     之外, fiber 上下文里没有 Location.Service), **不带** location。
+// 所以不能用 `evLoc !== selfDir` 一刀切 —— 那样会把所有 execution.* 静默丢掉,
+// 表现为"续命 / 轮次清零 / 心跳 disarm 全部不生效", 且没有任何报错(已实机复现,
+// 2026-10-20 事故: 10 次原生重试耗尽后 90 秒会话直接 failed)。
+//
+// 判据: 有信封 → 信封是权威(location 级事件高频, 走这条快路径避免逐事件查库);
+//       无信封 → 用 sessionID 反查会话目录再比(调用方负责查询)。
+export function resolveEventOwner(
+  evLoc: string | undefined,
+  selfDir: string,
+  sessionDir: string | undefined,
+): "match" | "skip" {
+  const loc = String(evLoc ?? "")
+  if (loc) return loc === selfDir ? "match" : "skip"
+  const dir = String(sessionDir ?? "")
+  if (!dir) return "skip"
+  return dir === selfDir ? "match" : "skip"
+}
+
 // 轮次标记的文本前缀。标记的 text = 前缀 + 随机 token。
 // 注意: 出口过滤已改为按 message.id(MESSAGE_ID_PREFIX)剥, 不再依赖文本;
 // text 前缀只用于在 session DB / 日志里一眼辨认"这是插件注入的", 以及界面显示时的可读性。
