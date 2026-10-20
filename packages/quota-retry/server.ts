@@ -39,13 +39,13 @@
 //   ❌ on-demand 降级链: 已移除(2.0 无模型路由能力; 见 issue #2)
 
 import { Plugin } from "@opencode/plugin/effect"
-import { Effect, Fiber, Schema, Stream } from "effect"
+import { Effect, Schema, Stream } from "effect"
 import {
   computeWaitMs,
   expandProviders,
   isQuotaError,
   isQuotaResponse,
-  needsHeartbeat,
+  pickKeepaliveTarget,
   parseResetAtMs,
   shouldContinue,
   zhipuResetAtMs,
@@ -138,13 +138,24 @@ export default Plugin.define({
     // providerID -> 出站 Authorization 头(zhipu 配额查询的 apiKey 回退来源, 对齐 1.x)
     const authCache = new Map<string, string>()
 
-    // ── 部件 1c: 长等待心跳(插件自己的定时 fiber, 框架原语) ──
-    // 每个长等待一个 fiber: 随插件 Scope 生灭(插件卸载自动停), 等待结束显式中断。
-    // 发送 = 一条 durable 标记(session.synthetic, resume:false → 只入队不唤醒, 不打断睡眠);
-    // 标记文本用同一前缀, 出口会被 strip 剥掉, 不进入模型请求。
+    // ── 部件 1c: location 保活(上游 #57416 的临时替代, 配置 keepalive:false 可整体关闭) ──
+    // 防的问题: location 60 分钟无 durable 会话事件 → 宿主以 reason="inactivity" 打断执行
+    // 并回收 location, 后台 shell 进程随回收被杀(生产已踩: 2026-10-19 日报后台任务之死)。
+    // 上游 anomalyco/opencode#57416(2026-10-20 合并)在宿主内做了同样的保护(TTL 到期时
+    // SessionExecution.active ∪ Job.runningBackground 非空 → 刷新保留); 它随正式 release
+    // 落地并升级后, 本模块即可用 keepalive:false 关闭, 轮次续命不受影响。
+    // 插件拿不到宿主的内存注册表, 用事件流近似同一保护集:
+    //   activeExecutions: execution.started ↔ succeeded/failed/interrupted
+    //     (retry 等待/question/permission/工具/前后台 subagent 都在某个执行内, 自动覆盖)
+    //   runningShells:   session.shell.started ↔ ended(后台 bash)
+    // 旧版是"每个 retry 等待一个心跳 fiber", 现在合并为 location 级单 sweeper:
+    // 有 pending 才发, 且每周期只发一条 —— TTL 是 location 级的, 一条 durable 事件就够;
+    // 无 pending 绝不发(给已回收的 location 发 synthetic 会把它复活)。
     const heartbeatMs = Number(cfg.heartbeatMs ?? DEFAULT_HEARTBEAT_MS)
-    dbg("[boot] setup:", String(ctx.location?.directory ?? ""), "heartbeatMs=", heartbeatMs)
-    const heartbeats = new Map<string, Fiber.Fiber<void>>() // sid -> 定时 fiber
+    const keepaliveOn = cfg.keepalive !== false && Number.isFinite(heartbeatMs) && heartbeatMs > 0
+    dbg("[boot] setup:", String(ctx.location?.directory ?? ""), "heartbeatMs=", heartbeatMs, "keepalive=", keepaliveOn)
+    const activeExecutions = new Set<string>() // sid(活跃执行, 插入序 = 激活序)
+    const runningShells = new Map<string, string>() // shellID -> sid(插入序 = 启动序)
 
     const sendHeartbeat = (sid: string) => {
       const now = Date.now()
@@ -153,49 +164,39 @@ export default Plugin.define({
           sessionID: sid as any,
           id: `${MESSAGE_ID_PREFIX}-heartbeat-${now.toString(36)}` as any,
           text: `${HEARTBEAT_TEXT_PREFIX}${Math.random().toString(36).slice(2, 10)}`,
-          description: `${MARKER_PREFIX} heartbeat`,
+          description: `${MARKER_PREFIX} keepalive`,
           // 只刷 location TTL: 不唤醒(不打断正在进行的等待), 也不进模型请求(context hook 按 id 剥)
           resume: false,
         })
         .pipe(Effect.asVoid)
     }
 
-    const armHeartbeat = (sid: string, delayMs: number) =>
-      Effect.gen(function* () {
-        if (!sid || !needsHeartbeat(delayMs, heartbeatMs)) return
-        const prev = heartbeats.get(sid)
-        if (prev) yield* Fiber.interrupt(prev)
-        dbg("[heartbeat] arm:", sid, "heartbeatMs=", heartbeatMs)
-        const fiber = yield* Effect.forkScoped(
-          Effect.gen(function* () {
-            // 每个间隔发一条; 发失败就停(下次等待会重新 arm), 不让坏 fiber 空转。
-            while (true) {
-              yield* Effect.sleep(heartbeatMs)
-              const ok = yield* sendHeartbeat(sid).pipe(
-                Effect.as(true),
-                Effect.catch((err) =>
-                  Effect.sync(() => {
-                    dbg("[heartbeat] FAIL:", String((err as any)?.message ?? err).slice(0, 160))
-                    return false
-                  }),
-                ),
+    if (keepaliveOn) {
+      yield* Effect.forkScoped(
+        Effect.gen(function* () {
+          // 单循环 sweeper: 每周期醒一次, 发失败记日志继续(下个周期重试), 不让坏 fiber 退出。
+          while (true) {
+            yield* Effect.sleep(heartbeatMs)
+            const target = pickKeepaliveTarget(activeExecutions, runningShells.values())
+            if (!target) continue
+            const ok = yield* sendHeartbeat(target).pipe(
+              Effect.as(true),
+              Effect.catch((err) =>
+                Effect.sync(() => {
+                  dbg("[keepalive] FAIL:", String((err as any)?.message ?? err).slice(0, 160))
+                  return false
+                }),
+              ),
+            )
+            if (ok)
+              dbg(
+                "[keepalive] sent:", target,
+                "active=", activeExecutions.size, "shells=", runningShells.size,
               )
-              if (!ok) break
-              dbg("[heartbeat] sent:", sid)
-            }
-          }),
-        )
-        heartbeats.set(sid, fiber)
-      })
-
-    const disarmHeartbeat = (sid: string, reason: string) =>
-      Effect.gen(function* () {
-        const fiber = heartbeats.get(sid)
-        if (!fiber) return
-        heartbeats.delete(sid)
-        dbg("[heartbeat] disarm:", reason, sid)
-        yield* Fiber.interrupt(fiber)
-      })
+          }
+        }),
+      )
+    }
 
     // 本 turn 是否处于"续命救援"中(配额精确等待命中, 或已开始轮次)
     const inRescue = (sid: string) => quotaHit.has(sid) || rounds.has(sid)
@@ -207,7 +208,6 @@ export default Plugin.define({
         quotaHit.delete(sid)
         lastFailure.delete(sid)
         lastFailureMessage.delete(sid)
-        yield* disarmHeartbeat(sid, "succeeded")
       })
 
     // ── 部件 3: 记录出站 Authorization(配额查询/改写需要 apiKey 时使用) ──
@@ -435,36 +435,37 @@ export default Plugin.define({
           }
           return
         }
+        if (type === "session.execution.started") {
+          // 保活保护集: 执行活跃期间(含 retry 睡眠/question/permission/工具/subagent)记为 pending
+          activeExecutions.add(String(data.sessionID ?? ""))
+          return
+        }
         if (type === "session.execution.interrupted") {
+          activeExecutions.delete(String(data.sessionID ?? ""))
           stopped.add(data.sessionID)
-          yield* disarmHeartbeat(String(data.sessionID ?? ""), "interrupted")
           return
         }
-        if (type === "session.step.started") {
-          // 等待结束、步骤已开始 → 不再需要心跳(下一次等待会重新 arm)
-          yield* disarmHeartbeat(String(data.sessionID ?? ""), "step.started")
+        if (type === "session.shell.started") {
+          // 后台 shell 进入保护集(shell 事件只有带 sessionID 的才会发布)
+          const shellSid = String(data.sessionID ?? "")
+          const shellID = String(data.shell?.id ?? "")
+          if (shellSid && shellID) runningShells.set(shellID, shellSid)
           return
         }
-        if (type === "session.retry.scheduled") {
-          // 重试已排定(durable, 带绝对时刻 at) → 按剩余等待 arm 长等待心跳。
-          // 必须在这里而不是 retry hook: 宿主排定重试的同一流程里会先发 step.started,
-          // 在 hook 里 arm 会被随后的 step.started 删掉(实测: arm 后同秒被 disarm, 心跳永不发)。
-          const sid = String(data.sessionID ?? "")
-          const at = Number(data.at)
-          if (sid && Number.isFinite(at)) {
-            yield* armHeartbeat(sid, at - Date.now())
-          }
+        if (type === "session.shell.ended") {
+          // exited/timeout/killed/removed 都会发 ended → 统一移出保护集
+          runningShells.delete(String(data.shell?.id ?? ""))
           return
         }
         if (type === "session.execution.succeeded") {
+          activeExecutions.delete(String(data.sessionID ?? ""))
           yield* resetSession(data.sessionID) // turn 完成: 轮次状态清零(新 turn 重新计轮)
           return
         }
         if (type !== "session.execution.failed") return
         const sid = String(data.sessionID ?? "")
         if (!sid || stopped.has(sid)) return
-        // 失败即等待结束: 先停心跳(续命后会由新的 retry.scheduled 重新 arm)。
-        yield* disarmHeartbeat(sid, "execution.failed")
+        activeExecutions.delete(sid) // 执行已终态; 若续命, 新 execution.started 会重新加入
         // 续命触发: 配额救援中, 或失败错误命中续命策略(可重试类型 / 429+5xx / 自定义 match)。
         const failure = data.error ?? lastFailure.get(sid)
         if (!inRescue(sid) && !shouldContinue(failure, cfg?.continueOn)) return

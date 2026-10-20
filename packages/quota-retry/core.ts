@@ -48,12 +48,15 @@ export type PluginConfig = {
   maxRounds?: number
   // 续命触发策略(默认: 可重试错误类型 + 429/5xx)。
   continueOn?: ContinuePolicy
-  // 长等待心跳间隔(ms)。opencode 的 location 不活动回收在 60 分钟无 durable 会话事件时以
-  // reason="inactivity" 打断正在等待的执行(core/src/location-activity.ts, TTL 写死、只被
-  // "带 location 的 durable 会话事件"刷新)。等待配额重置期间不产生事件, 所以超过 60 分钟的
-  // 等待会被掐断。心跳 = 等待期间落一条 durable 标记(session.synthetic, resume:false,
-  // 不唤醒执行), 让 TTL 持续被刷新; 发送时机由宿主事件驱动(插件只做被调用时能做的事),
-  // 每次收到事件时检查到期。默认 45 分钟(留余量); 0 = 关闭心跳。
+  // location 保活总开关(默认 true)。防的是: location 60 分钟无 durable 会话事件 → 宿主以
+  // reason="inactivity" 打断执行并回收 location(后台 shell 进程随回收被杀, 生产已踩)。
+  // 模型与上游 anomalyco/opencode#57416(2026-10-20 合并)的保护集对齐, 数据源是插件可见的
+  // 事件流; 该修复随正式 release 落地并升级后, 设 keepalive:false 即可整体关闭
+  // (轮次续命不受影响)。
+  keepalive?: boolean
+  // 保活扫描间隔(ms)。每 45 分钟(默认, 低于 60 分钟 TTL 留余量)检查一次:
+  // 有 pending(活跃执行/后台 shell)→ 发一条 durable 标记刷新本 location TTL; 无 → 不发。
+  // 0 = 等效 keepalive:false。
   heartbeatMs?: number
 }
 
@@ -145,13 +148,13 @@ export function computeWaitMs(opts: {
   return Math.max(min, Math.ceil(base))
 }
 
-// 该等待是否需要心跳: 只有"等待长于心跳间隔"才需要(短等待本来就在 TTL 内)。
-// heartbeatMs <= 0 / 非有限值 = 关闭心跳。
-export function needsHeartbeat(delayMs: number, heartbeatMs?: number): boolean {
-  const hb = heartbeatMs ?? DEFAULT_HEARTBEAT_MS
-  if (!Number.isFinite(hb) || hb <= 0) return false
-  if (!Number.isFinite(delayMs) || delayMs <= 0) return false
-  return delayMs > hb
+// 保活目标选择: 优先"活跃执行"里最早的会话, 否则"后台 shell"里最早的会话; 都空 → undefined。
+// 只取一个: TTL 是 location 级的, 一条 durable 事件就能整体刷新(与上游 #57416 的保护集
+// 对齐 —— 它用内存注册表, 插件只能用事件流近似, 语义一致)。
+export function pickKeepaliveTarget(active: Iterable<string>, shellSids: Iterable<string>): string | undefined {
+  for (const sid of active) if (sid) return sid
+  for (const sid of shellSids) if (sid) return sid
+  return undefined
 }
 
 
