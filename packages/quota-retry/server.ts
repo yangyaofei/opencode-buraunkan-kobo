@@ -15,6 +15,12 @@
 //   3. 出口净化 — session.http.request hook 剥掉标记 synthetic 在出站请求里映射的
 //      尾部 user 消息(按文本前缀判定, 不按"空"判定)。
 //
+// ⚠ 重试动作必须由宿主 runner 执行, 插件不要自己 fetch 重放:
+//   重试徽标来自宿主发布的 session.retry.scheduled(ACP 映射成 session_info_update._meta),
+//   插件只能 subscribe、不能 publish。在 http hook 里自行重放请求虽然也能吞掉 429,
+//   但 TUI/OpenChamber 只会看到"卡住", 没有 attempt/倒计时 —— 可见性是硬需求,
+//   插件只负责算 delay, 重试动作留给宿主。
+//
 // 长等待心跳(effect 形态的核心动机): 等待期间不产生 durable 会话事件, opencode 的
 // location 不活动回收(60 分钟 TTL, core/src/location-activity.ts, 只被"带 location 的
 // durable 会话事件"刷新)会把长等待打断。心跳 = 等待期间每 heartbeatMs 落一条 durable
@@ -363,8 +369,19 @@ export default Plugin.define({
         const data = ev?.data ?? ev
         // 事件流是全 location 广播(每个实例都收到): 只处理本实例自己 location 的事件。
         // 否则同一个会话会被每个实例各处理一遍(重复心跳 / 重复续命 / 重复标记——
-        // 实测 3 个 location 实例 = 3 条重复标记)。会话事件都带 location 信封
-        // (bus.publish 从发布者上下文的 Location.Service 取), 无 location 的全局事件与本插件无关。
+        // 实测 3 个 location 实例 = 3 条重复标记)。
+        //
+        // ⚠ 不要假设"会话事件都带 location 信封"。宿主 2.0.32 实测:
+        //   · step.* / inbox.* / tool.* / retry.scheduled 等 location 级事件: 带 location
+        //     (bus.publish 从发布者上下文的 Location.Service 取);
+        //   · execution.*(started/succeeded/failed/interrupted): **不带** —— 它们由服务器级
+        //     执行队列发布(SessionExecution.claimed/settled 回调), 发布点在 location 作用域
+        //     之外, fiber 上下文里没有 Location.Service。
+        // 因此下面这行只比较信封的写法会把所有 execution.* 静默丢弃: 续命(execution.failed)、
+        // 轮次清零(execution.succeeded)、失败时 disarm 心跳全部变成死代码, 且无任何报错。
+        // 2026-10-20 的事故正是如此(90 秒原生重试耗尽后会话直接 failed)。
+        // 若要让这些事件真正生效, 归属判断必须补上"无信封 → 按 sessionID 反查会话目录"的
+        // 分支, 而不是只改这一行比较。
         const evLoc = String(ev?.location?.directory ?? "")
         if (evLoc !== String(ctx.location?.directory ?? "")) return
         if (type === "session.inbox.enqueued" && data?.item?.type === "user") {
