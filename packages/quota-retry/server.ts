@@ -435,11 +435,13 @@ export default Plugin.define({
           return
         }
         if (type === "session.execution.started") {
-          // 新执行开始: 清掉上一 turn 的失败残留 —— 否则本轮若未经 step.failed 直接失败
-          // (drain 级错误), 幂等键会指向旧消息, 撞上旧标记被误判"已续过"而静默不唤醒。
           const startedSid = String(data.sessionID ?? "")
+          // 新执行开始: 清掉上一 turn 的失败残留 —— 否则本轮若未经 step.failed 直接失败
+          // (drain 级错误), 幂等键会指向旧消息, 撞上旧标记被误判"已续过"而静默不唤醒(#18 review)。
           lastFailure.delete(startedSid)
           lastFailureMessage.delete(startedSid)
+          // 保活保护集: 执行活跃期间(含 retry 睡眠/question/permission/工具/subagent)记为 pending
+          activeExecutions.add(startedSid)
           return
         }
         if (type === "session.step.failed") {
@@ -454,11 +456,6 @@ export default Plugin.define({
             // 续命标记要用它做幂等键(同一次失败 → 同一个 id)。
             if (data.assistantMessageID) lastFailureMessage.set(String(data.sessionID), String(data.assistantMessageID))
           }
-          return
-        }
-        if (type === "session.execution.started") {
-          // 保活保护集: 执行活跃期间(含 retry 睡眠/question/permission/工具/subagent)记为 pending
-          activeExecutions.add(String(data.sessionID ?? ""))
           return
         }
         if (type === "session.execution.interrupted") {
