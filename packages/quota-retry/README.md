@@ -65,7 +65,8 @@
   "quotaCacheMs": 60000,
   "logFile": true,            // 可选; 默认关闭。true = 默认路径, 字符串 = 自定义路径
   "maxRounds": -1,
-  "heartbeatMs": 2700000,     // 长等待心跳间隔(默认 45 分钟; 0 = 关闭)
+  "keepalive": true,          // location 保活(默认开; 上游 #57416 随 release 落地后设 false 关闭)
+  "heartbeatMs": 2700000,     // 保活扫描间隔(默认 45 分钟; 0 = 等效 keepalive:false)
   // 续命触发策略(可选; 缺省 = 可重试类型 + 429/5xx)
   "continueOn": {
     "types": ["provider.quota", "provider.rate-limit", "provider.internal", "provider.transport"],
@@ -78,8 +79,8 @@
 
 - `continueOn.types` / `statuses` / `match` 任一命中即续命；`denyTypes` 优先（默认含 auth/content-filter/invalid-request/unsupported-operation/no-route）。要在默认 deny 的类型上续命，需显式把它从 `denyTypes` 移除（如 `"denyTypes": []`）。
 - `continueOn.statuses` 缺省 = 429 与全部 5xx。
-- `heartbeatMs`（默认 2700000 = 45 分钟）：**长等待心跳**。opencode 的 location 不活动回收在 60 分钟内没有 durable 会话事件时会以 `reason: "inactivity"` 打断正在等待的执行（`packages/core/src/location-activity.ts`：TTL 写死 60 分钟、只被"带 location 的 durable 会话事件"刷新、无配置口），而"等待配额重置"期间不产生任何事件，所以超过 60 分钟的等待会被掐断（实测：等待开始后 61 分钟 `location services evicted` + `outcome=interrupted`）。心跳 = 等待期间每 45 分钟落一条 durable 标记（`session.synthetic`，`resume: false` → 只入队不唤醒，**不打断睡眠**），让 TTL 持续被刷新；标记 `id = msg_quota-retry-heartbeat-<ts>`（与轮次标记同样在 `context` hook 里按 id 前缀剥除），**不进入模型请求**；界面只显示 `quota-retry heartbeat` 这行标签，长前缀不出现在界面。等待本身仍是一次到重置点（不切段）。代价：每次心跳在会话里多一条标记行。设 `0` 关闭。
-  - **实现方式（effect 形态的原因）**：心跳是**插件自己的定时 fiber**——每个长等待 `Effect.forkScoped` 一个 `Effect.sleep` 循环，等待结束（`step.started` / `interrupted` / `succeeded` / `execution.failed`）即中断，插件卸载时随 Scope 自动清理。定时能力来自 opencode 宿主提供的 Effect 运行时（与内置插件 `provider/digitalocean.ts` 的周期循环同一原语），**不依赖任何宿主周期事件**。
+- `keepalive`（默认 `true`）+ `heartbeatMs`（默认 2700000 = 45 分钟）：**location 保活**。opencode 的 location 不活动回收在 60 分钟内没有 durable 会话事件时会以 `reason: "inactivity"` 打断执行并回收 location（`packages/core/src/location-activity.ts`：TTL 写死 60 分钟、只被"带 location 的 durable 会话事件"刷新、无配置口）——**后台 shell 进程随回收被杀**（生产实证：2026-10-19 日报后台任务，最后 durable 事件 61 分钟后被 evict）。保护集与上游 [anomalyco/opencode#57416](https://github.com/anomalyco/opencode/pull/57416)（2026-10-20 合并）对齐，插件侧用事件流近似：**活跃执行**（`execution.started ↔ succeeded/failed/interrupted`，自动覆盖 retry 睡眠 / question / permission / 工具 / 前后台 subagent）∪ **后台 shell**（`session.shell.started ↔ ended`）。每 45 分钟扫一次：非空 → 给最早目标落一条 durable 标记（`session.synthetic`，`resume: false` → 不唤醒、`context` hook 按 id 剥除不进模型请求），刷新本 location TTL；**空 → 不发**（不能无端复活已回收的 location）。上游 #57416 随正式 release 落地并升级后，设 `keepalive: false` 整体关闭（轮次续命不受影响）。
+  - **实现方式（effect 形态的原因）**：sweeper 是**插件自己的定时 fiber**——每个 location 实例 `Effect.forkScoped` 一个 `Effect.sleep` 循环，插件卸载时随 Scope 自动清理。定时能力来自 opencode 宿主提供的 Effect 运行时（与内置插件 `provider/digitalocean.ts` 的周期循环同一原语），**不依赖任何宿主周期事件**。
 
 ## 安装
 
