@@ -98,9 +98,28 @@ function isValid(m: any): m is CatalogModel {
   return !!(m && typeof m.limit?.context === "number" && m.limit.context > 0 && m.limit.output < m.limit.context)
 }
 
-// 按 modelID 取模型配置: 优先 opencode 官方 catalog > 厂商官方 > 第一个有效数据
-export function findModelMeta(catalog: Catalog, modelID: string): CatalogModel | null {
-  for (const pid of ["opencode", "zhipuai", "deepseek"]) {
+// 优先 provider: 目录里字段完整、可信的条目（实测 reasoning_options/limit 无缺项）。
+// 用户可在 catalog-bridge.jsonc 的 preferredProviders 里追加自己的优先 provider。
+export const DEFAULT_PRIORITY_PROVIDERS = ["deepseek", "zhipuai", "opencode-go", "opencode"]
+
+/** 合并默认优先列表与用户配置（去重、保序：默认在前，配置追加在后）。 */
+export function mergePriority(extra?: readonly string[]): string[] {
+  const out: string[] = []
+  for (const id of [...DEFAULT_PRIORITY_PROVIDERS, ...(extra ?? [])]) {
+    const pid = String(id ?? "").trim()
+    if (!pid || out.includes(pid)) continue
+    out.push(pid)
+  }
+  return out
+}
+
+// 按 modelID 取模型配置: 优先列表逐个查; 都没有则按目录原顺序取第一个有效数据。
+export function findModelMeta(
+  catalog: Catalog,
+  modelID: string,
+  priority: readonly string[] = DEFAULT_PRIORITY_PROVIDERS,
+): CatalogModel | null {
+  for (const pid of priority) {
     const m = catalog[pid]?.models?.[modelID]
     if (isValid(m)) return m
   }
@@ -130,6 +149,20 @@ export function isDefaultCapabilities(caps: { tools: boolean; input: string[]; o
     caps.output.length === MODEL_INFO_DEFAULTS.capabilities.output.length &&
     caps.output.every((v, i) => v === MODEL_INFO_DEFAULTS.capabilities.output[i])
   )
+}
+
+/**
+ * 平台为 openai-compatible 自动生成的默认 variants（low/medium/high）。
+ * 这类值不是用户手写的，命中时应允许用目录里的真实选项覆盖；
+ * 用户自定义的其它集合一律不动。
+ */
+export function isPlatformDefaultVariants(
+  variants: Array<{ id: string; settings?: Record<string, unknown> }>,
+): boolean {
+  if (variants.length !== 3) return false
+  const ids = variants.map((v) => String(v.id)).sort()
+  if (ids.join(",") !== "high,low,medium") return false
+  return variants.every((v) => v.settings?.reasoningEffort === String(v.id))
 }
 
 const STATUS_MAP: Record<string, "alpha" | "beta" | "deprecated"> = {
@@ -185,9 +218,14 @@ export function applyMeta(
     const mapped = STATUS_MAP[meta.status]
     if (mapped) model.status = mapped
   }
-  // variants: 从 reasoning_options effort 自动生成(仅 openai-compatible;
-  // 2.0 对该包原生已生成 reasoningEffort variants, 此处仅在为空时兜底)
-  if (model.variants.length === 0 && isOpenAICompatible && meta.reasoning_options) {
+  // variants: 从 reasoning_options effort 自动生成(仅 openai-compatible)。
+  // 平台会给 openai-compatible 预生成 low/medium/high 默认集合；那不是用户手写的值，
+  // 命中默认集合时用目录里的真实选项覆盖（用户自定义的其它集合不动）。
+  if (
+    (model.variants.length === 0 || isPlatformDefaultVariants(model.variants)) &&
+    isOpenAICompatible &&
+    meta.reasoning_options
+  ) {
     const effort = meta.reasoning_options.find((o) => o.type === "effort")
     if (effort && Array.isArray(effort.values)) {
       model.variants = effort.values

@@ -25,6 +25,24 @@
 - 核心约定同 1.x：**模型外层 key 对齐 models.dev 里的模型名**（如 `glm-5.3`）。
 - Docker 实测：limit / cost(含 cache 读写) / capabilities(=tool_call+modalities) / family / status / time.released / variants(reasoningEffort) 全部补上，provider 世界完好。
 
+## 同名模型来自哪个 provider
+
+同一个模型键在 models.dev 里常出现在多个 provider 下，而各条目的字段并不完全一致（偶有空 `reasoning_options`、不同 limit/报价）。查找规则：
+
+1. 先按内置优先列表查：`deepseek` → `zhipuai` → `opencode-go` → `opencode`；
+2. 再按用户配置追加的 provider 查（见下）；
+3. 都没有才回退到"按目录顺序取第一个有效条目"。
+
+```jsonc
+// ~/.config/opencode/catalog-bridge.jsonc（或 <project>/.opencode/catalog-bridge.jsonc）
+{
+  // 追加到内置优先列表之后，例如把自建网关的元数据来源排在前面
+  "preferredProviders": ["my-provider"]
+}
+```
+
+`variants` 的覆盖规则：目录值为空、或当前值恰好是平台自动生成的默认 `low/medium/high` 时，用目录里的 `reasoning_options` 覆盖；用户自定义的其它集合不动。
+
 ## 重要教训（为什么第一版失败）
 
 第一版遍历了**全部 provider** 并用 `provider.add` 覆盖——三个问题：

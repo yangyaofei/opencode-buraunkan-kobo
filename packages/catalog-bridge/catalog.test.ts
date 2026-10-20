@@ -4,6 +4,8 @@ import {
   findModelMeta,
   isDefaultCapabilities,
   isDefaultLimit,
+  isPlatformDefaultVariants,
+  mergePriority,
   MODEL_INFO_DEFAULTS,
   type Catalog,
 } from "./catalog"
@@ -45,8 +47,15 @@ function freshModel() {
 }
 
 describe("findModelMeta", () => {
-  test("opencode 官方优先", () => {
-    expect(findModelMeta(catalog, "glm-5.3")?.family).toBe("fam-opencode")
+  test("厂商官方优先于 opencode 网关", () => {
+    expect(findModelMeta(catalog, "glm-5.3")?.family).toBe("fam-zhipuai")
+  })
+  test("优先列表内按顺序命中(deepseek 在 zhipuai 之前)", () => {
+    const both = {
+      ...catalog,
+      deepseek: { models: { "glm-5.3": makeMeta("deepseek") } },
+    } as Catalog
+    expect(findModelMeta(both, "glm-5.3")?.family).toBe("fam-deepseek")
   })
   test("无官方时厂商次之", () => {
     expect(findModelMeta(catalog, "deepseek-v4.1")?.family).toBe("fam-other")
@@ -54,6 +63,32 @@ describe("findModelMeta", () => {
   test("非法数据跳过", () => {
     expect(findModelMeta(catalog, "bad-model")).toBeNull()
     expect(findModelMeta(catalog, "nope")).toBeNull()
+  })
+  test("配置追加的 provider 参与优先查找", () => {
+    const withPref = {
+      ...catalog,
+      "my-provider": { models: { "deepseek-v4.1": makeMeta("mine") } },
+    } as Catalog
+    expect(mergePriority(["my-provider"])).toEqual([
+      "deepseek",
+      "zhipuai",
+      "opencode-go",
+      "opencode",
+      "my-provider",
+    ])
+    expect(findModelMeta(withPref, "deepseek-v4.1", mergePriority(["my-provider"]))?.family).toBe("fam-mine")
+  })
+  test("优先列表都没有时回退目录顺序", () => {
+    expect(findModelMeta(catalog, "deepseek-v4.1", ["nonexistent"])?.family).toBe("fam-other")
+  })
+  test("mergePriority 去重且忽略空值", () => {
+    expect(mergePriority(["", "opencode", "  ", "x", "x"])).toEqual([
+      "deepseek",
+      "zhipuai",
+      "opencode-go",
+      "opencode",
+      "x",
+    ])
   })
 })
 
@@ -96,6 +131,26 @@ describe("applyMeta", () => {
     applyMeta(m, { ...catalog.opencode.models!["glm-5.3"]!, status: "weird" }, undefined)
     expect(m.status).toBe("active")
   })
+  test("平台默认 low/medium/high 会被目录选项覆盖", () => {
+    const m = freshModel()
+    m.variants = [
+      { id: "low", settings: { reasoningEffort: "low" } },
+      { id: "medium", settings: { reasoningEffort: "medium" } },
+      { id: "high", settings: { reasoningEffort: "high" } },
+    ]
+    applyMeta(m, catalog.opencode.models!["glm-5.3"]!, PKG_NEW)
+    expect(m.variants).toEqual([
+      { id: "low", settings: { reasoningEffort: "low" } },
+      { id: "high", settings: { reasoningEffort: "high" } },
+      { id: "max", settings: { reasoningEffort: "max" } },
+    ])
+  })
+  test("用户自定义 variants 不被覆盖", () => {
+    const m = freshModel()
+    m.variants = [{ id: "custom", settings: { reasoningEffort: "custom" } }]
+    applyMeta(m, catalog.opencode.models!["glm-5.3"]!, PKG_NEW)
+    expect(m.variants).toEqual([{ id: "custom", settings: { reasoningEffort: "custom" } }])
+  })
 })
 
 describe("默认值检测", () => {
@@ -104,5 +159,23 @@ describe("默认值检测", () => {
     expect(isDefaultLimit({ context: 128_000, output: 32_000 })).toBe(false)
     expect(isDefaultCapabilities({ tools: true, input: ["text", "image"], output: ["text"] })).toBe(true)
     expect(isDefaultCapabilities({ tools: false, input: ["text", "image"], output: ["text"] })).toBe(false)
+  })
+
+  test("isPlatformDefaultVariants 只认 low/medium/high", () => {
+    expect(
+      isPlatformDefaultVariants([
+        { id: "low", settings: { reasoningEffort: "low" } },
+        { id: "medium", settings: { reasoningEffort: "medium" } },
+        { id: "high", settings: { reasoningEffort: "high" } },
+      ]),
+    ).toBe(true)
+    expect(
+      isPlatformDefaultVariants([
+        { id: "low", settings: { reasoningEffort: "low" } },
+        { id: "high", settings: { reasoningEffort: "high" } },
+        { id: "max", settings: { reasoningEffort: "max" } },
+      ]),
+    ).toBe(false)
+    expect(isPlatformDefaultVariants([{ id: "custom", settings: { reasoningEffort: "custom" } }])).toBe(false)
   })
 })

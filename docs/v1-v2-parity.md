@@ -89,7 +89,13 @@
 
 ### 3.2 配置
 
-无独立配置文件（两代一致，靠 opencode.jsonc 的 provider 定义 + models.dev 目录）。
+V1 无独立配置文件（靠 opencode.jsonc 的 provider 定义 + models.dev 目录）。V2 新增可选的 `catalog-bridge.jsonc`（项目 `.opencode/` 优先，全局 `~/.config/opencode/` 兜底）：
+
+```jsonc
+{ "preferredProviders": ["my-provider"] }
+```
+
+同名模型在 models.dev 里会出现在多个 provider 下且字段不完全一致，查找顺序为：内置优先列表（`deepseek` → `zhipuai` → `opencode-go` → `opencode`）→ 配置追加的 provider → 目录原顺序第一个有效条目。
 
 ---
 
