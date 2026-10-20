@@ -286,6 +286,27 @@ describe("resolveEventOwner(事件归属)", () => {
   })
 })
 
+describe("resolveEventOwner(事件归属)", () => {
+  const self = "/work/a"
+  test("带信封: 信封是权威(高频 location 级事件走这条快路径)", () => {
+    expect(resolveEventOwner("/work/a", self, undefined)).toBe("match")
+    expect(resolveEventOwner("/work/b", self, undefined)).toBe("skip")
+    // 信封与 session 目录冲突时信封优先(不会被 session 目录"救回来")
+    expect(resolveEventOwner("/work/b", self, "/work/a")).toBe("skip")
+  })
+  test("无信封: 按 session 目录反查(execution.* / usage.updated 的实际形态)", () => {
+    expect(resolveEventOwner("", self, "/work/a")).toBe("match")
+    expect(resolveEventOwner(undefined, self, "/work/b")).toBe("skip")
+  })
+  test("无信封且查不到会话: 丢弃(宁可漏处理, 不可跨 location 重复处理)", () => {
+    expect(resolveEventOwner("", self, undefined)).toBe("skip")
+    expect(resolveEventOwner(undefined, self, "")).toBe("skip")
+  })
+  test("回归: execution.* 无信封不再被一律丢弃(2026-10-20 事故根因)", () => {
+    expect(resolveEventOwner(undefined, "/mnt/media3/project/note", "/mnt/media3/project/note")).toBe("match")
+  })
+})
+
 describe("provider 凭据读取", () => {
   test("readProviderApiKeys: 无 bun:sqlite 或库缺失时返回 null 而非抛错", () => {
     expect(readProviderApiKeys("/nonexistent-dir-xyz")).toBe(null)

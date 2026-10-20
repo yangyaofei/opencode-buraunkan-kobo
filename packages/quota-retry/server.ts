@@ -302,6 +302,12 @@ export default Plugin.define({
     // retry 事件的 error 不带 body, 且首次失败时错误文案未必含配额特征(1.x 直接看响应,
     // 所以第一次就接管)。这里按 provider.statuses(默认 [429]) 捕获原始响应,
     // 判定放在 retry hook 里做(与 1.x 的响应驱动一致)。
+    //
+    // ⚠ 这里只捕获 body, 不要在这里 fetch 重放请求做"插件自己重试":
+    //   重试徽标来自宿主发布的 session.retry.scheduled(ACP 映射成
+    //   session_info_update._meta), 插件只能 subscribe、不能 publish。自己重放虽然能
+    //   吞掉 429, 但 TUI/OpenChamber 只会看到"卡住", 没有 attempt/倒计时。
+    //   重试动作必须交给宿主 runner, 插件只通过 retry hook 的 decision.delay 决定等多久。
     const onHttpResponse = async (evt: any): Promise<void> => {
       const providerID = String(evt?.model?.providerID ?? "")
       const p = expanded.get(providerID)

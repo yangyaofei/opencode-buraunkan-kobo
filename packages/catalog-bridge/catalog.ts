@@ -16,7 +16,7 @@
 //   status (枚举)                   ← status (仅映射合法枚举值)
 //   variants: [{id, settings{reasoningEffort}}] ← reasoning_options effort (仅
 //     @ai-sdk/openai-compatible, 参数名同 1.x)
-//   1.x 的 reasoning/temperature/interleaved/experimental 在 2.0 无对应字段, 不迁移。
+//   temperature → capabilities.temperature; interleaved.field → compatibility.reasoningField。
 //
 // 覆盖策略(同 1.x "只补缺失"): 2.0 未配置的模型带静态默认值(limit 200k/32k,
 // capabilities 默认, cost 空), 检测到"仍是默认值"才用 catalog 填充。
@@ -130,6 +130,35 @@ export function findModelMeta(
   return null
 }
 
+// 用于从"平台已播种的源 provider model"整份镜像元数据。
+// 只拷元数据字段, 不碰 id/modelID/providerID/package/settings/name/enabled/canonical。
+export const MIRROR_FIELDS = [
+  "limit",
+  "cost",
+  "capabilities",
+  "compatibility",
+  "variants",
+  "family",
+  "time",
+  "status",
+] as const
+
+export function mirrorMeta(
+  target: Record<string, any>,
+  source: Record<string, any> | undefined | null,
+): boolean {
+  if (!source) return false
+  let copied = false
+  for (const key of MIRROR_FIELDS) {
+    const value = source[key]
+    if (value === undefined) continue
+    // 源记录可能来自冻结快照, 深拷贝避免共享引用
+    target[key] = structuredClone(value)
+    copied = true
+  }
+  return copied
+}
+
 // 2.0 Model.Info 的静态默认值(packages/schema/src/model.ts Model.Info.pipe(statics))
 export const MODEL_INFO_DEFAULTS = {
   limitContext: 200_000,
@@ -182,6 +211,7 @@ export function applyMeta(
     capabilities: { tools: boolean; input: string[]; output: string[] }
     variants: Array<{ id: string; settings?: Record<string, unknown> }>
     family?: string
+    compatibility?: Record<string, unknown>
     time: { released: number }
     status: string
   },
@@ -209,10 +239,21 @@ export function applyMeta(
       output: meta.modalities?.output ?? [...MODEL_INFO_DEFAULTS.capabilities.output],
     }
   }
+  // capabilities.temperature: 1.x 直接从 models.dev 的 temperature 迁移, 2.0 同样有这个字段
+  if (model.capabilities.temperature === undefined && meta.temperature !== undefined) {
+    model.capabilities.temperature = meta.temperature
+  }
   if (!model.family && meta.family) model.family = meta.family
+  // compatibility.reasoningField: 1.x 的 interleaved.field 对应 2.0 的 compatibility.reasoningField
+  if (!model.compatibility?.reasoningField && meta.interleaved && typeof meta.interleaved === "object") {
+    const field = (meta.interleaved as { field?: unknown }).field
+    if (typeof field === "string" && field.trim()) {
+      model.compatibility = { ...(model.compatibility ?? {}), reasoningField: field }
+    }
+  }
   if (model.time.released === 0 && meta.release_date) {
     const ts = Date.parse(meta.release_date)
-    if (Number.isFinite(ts)) model.time.released = Math.floor(ts / 1000)
+    if (Number.isFinite(ts)) model.time.released = ts
   }
   if (model.status === "active" && meta.status) {
     const mapped = STATUS_MAP[meta.status]
