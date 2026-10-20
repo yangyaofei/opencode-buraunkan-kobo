@@ -135,6 +135,8 @@ export default Plugin.define({
     const lastFailure = new Map<string, { type?: string; status?: number; message?: string }>()
     // sid -> 最近一次失败 step 的 assistantMessageID(续命标记的幂等键, 见 redoRound)
     const lastFailureMessage = new Map<string, string>()
+    // sid -> 会话目录反查缓存(60s TTL; 无信封事件归属判定用, 见 handleEventInner)
+    const dirCache = new Map<string, { dir: string | undefined; at: number }>()
     // providerID -> 出站 Authorization 头(zhipu 配额查询的 apiKey 回退来源, 对齐 1.x)
     const authCache = new Map<string, string>()
 
@@ -340,13 +342,13 @@ export default Plugin.define({
         // 标记 text = 前缀 + 随机 token: 出口按 id 前缀剥除(见部件 0), 不靠"空"判定,
         // description 前台可见, id 自指定便于定位。
         //
-        // 幂等键 = 失败 step 的 assistantMessageID(拿不到时退回轮次号):
+        // 幂等键 = 失败 step 的 assistantMessageID(每轮失败各不相同, 见 step.failed 分支):
         //   · 同一次失败在多实例下算出同一个 id, 第二个注入得到冲突
         //     (synthetic 不是 upsert) → 视为"已被续过", 幂等跳过;
-        //   · 不用时间戳: 无法去重;
-        //   · 也不用纯轮次号: 插件实例重建后 rounds 归零会与旧标记撞 id,
-        //     反而"以为续过"而不再唤醒。
-        const failureKey = lastFailureMessage.get(sessionID) ?? `r${round}`
+        //   · 拿不到 assistantMessageID(drain 级失败, 未经 step.failed)→ 退回
+        //     轮次号+时间戳: 宁可多续一次(重复标记代价是多跑一轮), 也不能用可能撞旧标记的
+        //     纯轮次号 —— 那会静默丢续命, 与本插件的存在目的相反。
+        const failureKey = lastFailureMessage.get(sessionID) ?? `r${round}-${Date.now().toString(36)}`
         const markerID = `${MESSAGE_ID_PREFIX}-round-${sessionID}-${failureKey}`
         const markerText = `${MARKER_TEXT_PREFIX}${Math.random().toString(36).slice(2, 10)}`
         yield* ctx.session
@@ -365,8 +367,10 @@ export default Plugin.define({
             Effect.catch((err) =>
               Effect.sync(() => {
                 const msg = String((err as any)?.message ?? err)
+                const tag = String((err as any)?._tag ?? "")
                 // 幂等跳过: 同一次失败被第二个实例先续过了(synthetic 同 id 冲突)
-                if (/conflict|already exists/i.test(msg)) {
+                // 冲突判定 tag 优先(有结构化错误类型时), 文案正则兜底
+                if (/conflict|already exists/i.test(`${tag} ${msg}`)) {
                   dbg("[round] marker already injected, idempotent skip:", markerID)
                   return
                 }
@@ -393,19 +397,28 @@ export default Plugin.define({
         if (!evLoc) {
           const sid = String((data as any)?.sessionID ?? "")
           if (!sid) return // 全局事件(server.connected 等), 与本插件无关
-          const info = yield* ctx.session
-            .get({ sessionID: sid as any })
-            .pipe(
-              Effect.catch((e: any) =>
-                Effect.sync(() => {
-                  dbg("[owner] get error:", String(e?._tag ?? e?.message ?? e).slice(0, 140))
-                  return undefined as any
-                }),
-              ),
-            )
-          // Session.Info 没有顶层 directory —— 目录在 info.location.directory
-          const rawDir = (info as any)?.location?.directory
-          sessionDir = rawDir === undefined || rawDir === null ? undefined : String(rawDir)
+          // sid→dir 短 TTL 缓存: 事件流是全 location 广播, 无信封事件(execution.*/usage.updated)
+          // 每条都要反查一次 session, 多 location 部署下是热路径; 60s TTL 也兜住 session.move 的陈旧性。
+          const cached = dirCache.get(sid)
+          const fresh = cached && Date.now() - cached.at < 60_000
+          if (fresh) {
+            sessionDir = cached.dir
+          } else {
+            const info = yield* ctx.session
+              .get({ sessionID: sid as any })
+              .pipe(
+                Effect.catch((e: any) =>
+                  Effect.sync(() => {
+                    dbg("[owner] get error:", String(e?._tag ?? e?.message ?? e).slice(0, 140))
+                    return undefined as any
+                  }),
+                ),
+              )
+            // Session.Info 没有顶层 directory —— 目录在 info.location.directory
+            const rawDir = (info as any)?.location?.directory
+            sessionDir = rawDir === undefined || rawDir === null ? undefined : String(rawDir)
+            dirCache.set(sid, { dir: sessionDir, at: Date.now() })
+          }
           if (sessionDir === undefined) dbg("[owner] session lookup failed:", sid, type)
         }
         if (resolveEventOwner(evLoc, selfDir, sessionDir) === "skip") {
@@ -419,6 +432,14 @@ export default Plugin.define({
             stopped.add(String(data.sessionID))
             console.log(`[quota-retry] ${data.sessionID} 用户接管, 停止续命`)
           }
+          return
+        }
+        if (type === "session.execution.started") {
+          // 新执行开始: 清掉上一 turn 的失败残留 —— 否则本轮若未经 step.failed 直接失败
+          // (drain 级错误), 幂等键会指向旧消息, 撞上旧标记被误判"已续过"而静默不唤醒。
+          const startedSid = String(data.sessionID ?? "")
+          lastFailure.delete(startedSid)
+          lastFailureMessage.delete(startedSid)
           return
         }
         if (type === "session.step.failed") {
