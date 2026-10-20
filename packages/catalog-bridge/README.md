@@ -25,6 +25,12 @@
 - 核心约定同 1.x：**模型外层 key 对齐 models.dev 里的模型名**（如 `glm-5.3`）。
 - Docker 实测：limit / cost(含 cache 读写) / capabilities(=tool_call+modalities) / family / status / time.released / variants(reasoningEffort) 全部补上，provider 世界完好。
 
+## 元数据从哪来
+
+1. **优先**：按下面的优先级找到源 provider（如 `deepseek`）**已经播种好的 model 记录**，把 `modelID` 之外的元数据（`limit / cost / capabilities / compatibility / variants / family / time / status`）整份镜像过来。这样 variants 里 `none` 和 `body.thinking` 这类由协议生成的字段也能 1:1 带上，且不需要源 provider 被配置或可用（只读注册表，不发请求）。
+2. **兜底**：源 provider 不存在时，用自拉的 models.dev JSON 做字段映射（`temperature → capabilities.temperature`、`interleaved.field → compatibility.reasoningField`、`time.released` 用毫秒）。
+3. 平台 config 插件的晚注册 transform 会重算 variants，所以插件在启动后（250ms/1.2s/4s）以及每次 `provider.updated` 后重新注册自己的 transform，保证最后落盘。
+
 ## 同名模型来自哪个 provider
 
 同一个模型键在 models.dev 里常出现在多个 provider 下，而各条目的字段并不完全一致（偶有空 `reasoning_options`、不同 limit/报价）。查找规则：

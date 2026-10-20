@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test"
 import {
   applyMeta,
   findModelMeta,
+  mirrorMeta,
   isDefaultCapabilities,
   isDefaultLimit,
   isPlatformDefaultVariants,
@@ -27,6 +28,8 @@ function makeMeta(source: string) {
     release_date: "2026-08-01",
     status: "beta",
     modalities: { input: ["text"], output: ["text"] },
+    temperature: true,
+    interleaved: { field: "reasoning_content" },
     reasoning_options: [{ type: "effort", values: ["low", "high", null, "max"] }],
   }
 }
@@ -100,9 +103,10 @@ describe("applyMeta", () => {
     applyMeta(m, catalog.opencode.models!["glm-5.3"]!, PKG_NEW)
     expect(m.limit).toEqual({ context: 131072, output: 16384, input: 65536 })
     expect(m.cost).toEqual([{ input: 1, output: 2, cache: { read: 0.1, write: 0.5 } }])
-    expect(m.capabilities).toEqual({ tools: false, input: ["text"], output: ["text"] })
+    expect(m.capabilities).toEqual({ tools: false, input: ["text"], output: ["text"], temperature: true })
+    expect((m as any).compatibility).toEqual({ reasoningField: "reasoning_content" })
     expect(m.family).toBe("fam-opencode")
-    expect(m.time.released).toBe(Math.floor(Date.parse("2026-08-01") / 1000))
+    expect(m.time.released).toBe(Date.parse("2026-08-01"))
     expect(m.status).toBe("beta")
     expect(m.variants).toEqual([
       { id: "low", settings: { reasoningEffort: "low" } },
@@ -177,5 +181,65 @@ describe("默认值检测", () => {
       ]),
     ).toBe(false)
     expect(isPlatformDefaultVariants([{ id: "custom", settings: { reasoningEffort: "custom" } }])).toBe(false)
+  })
+})
+
+
+describe("mirrorMeta", () => {
+  const source: any = {
+    id: "deepseek-flash",
+    modelID: "deepseek-flash",
+    providerID: "deepseek",
+    package: "@opencode/ai/providers/deepseek",
+    settings: { baseURL: "https://api.deepseek.com" },
+    name: "DeepSeek V4.1 Flash 1017",
+    enabled: false,
+    limit: { context: 1000000, output: 393216 },
+    cost: [{ input: 0.15, output: 0.6, cache: { read: 0.003, write: 0 } }],
+    capabilities: { tools: true, input: ["text", "image"], output: ["text"], temperature: true },
+    compatibility: { reasoningField: "reasoning_content" },
+    variants: [
+      { id: "none", body: { thinking: { type: "disabled" } } },
+      { id: "low", settings: { reasoningEffort: "low" }, body: { thinking: { type: "enabled" } } },
+    ],
+    family: "deepseek-flash",
+    time: { released: 1792195200000 },
+    status: "active",
+  }
+
+  test("只拷白名单元数据, 不碰身份/连接字段", () => {
+    const target: any = {
+      id: "deepseek-flash",
+      modelID: "deepseek/deepseek-flash",
+      providerID: "deepseek-litellm",
+      package: "@opencode/ai/providers/openai-compatible",
+      settings: { baseURL: "https://litellm.example/v1" },
+      name: "DeepSeek Flash (LiteLLM)",
+      enabled: true,
+    }
+    expect(mirrorMeta(target, source)).toBe(true)
+    expect(target.limit).toEqual(source.limit)
+    expect(target.capabilities).toEqual(source.capabilities)
+    expect(target.compatibility).toEqual(source.compatibility)
+    expect(target.variants).toEqual(source.variants)
+    expect(target.time).toEqual(source.time)
+    expect(target.id).toBe("deepseek-flash")
+    expect(target.modelID).toBe("deepseek/deepseek-flash")
+    expect(target.providerID).toBe("deepseek-litellm")
+    expect(target.package).toBe("@opencode/ai/providers/openai-compatible")
+    expect(target.name).toBe("DeepSeek Flash (LiteLLM)")
+    expect(target.enabled).toBe(true)
+  })
+
+  test("深拷贝: 修改目标不影响源", () => {
+    const target: any = {}
+    mirrorMeta(target, source)
+    target.variants[0].id = "changed"
+    expect(source.variants[0].id).toBe("none")
+  })
+
+  test("源为空返回 false", () => {
+    expect(mirrorMeta({}, undefined)).toBe(false)
+    expect(mirrorMeta({}, null)).toBe(false)
   })
 })
