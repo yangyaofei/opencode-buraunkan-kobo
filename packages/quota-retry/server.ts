@@ -417,7 +417,13 @@ export default Plugin.define({
             // Session.Info 没有顶层 directory —— 目录在 info.location.directory
             const rawDir = (info as any)?.location?.directory
             sessionDir = rawDir === undefined || rawDir === null ? undefined : String(rawDir)
-            dirCache.set(sid, { dir: sessionDir, at: Date.now() })
+            // 只缓存成功结果: 查询失败(超时/实例刚启动)若是缓存了 undefined, 60s 内到达的
+            // execution.failed(一次性事件, 无重试)会被误判"非本 location"而静默丢续命(#18 review r2)。
+            // 失败不写缓存 → 下一条无信封事件(如 usage.updated)会再查, 等于免费重试。
+            if (sessionDir !== undefined) {
+              if (dirCache.size > 4096) dirCache.clear() // 粗上限: 防按会话数无限增长(插入序无法逐条淘汰, 清空代价可忽略)
+              dirCache.set(sid, { dir: sessionDir, at: Date.now() })
+            }
           }
           if (sessionDir === undefined) dbg("[owner] session lookup failed:", sid, type)
         }
