@@ -46,6 +46,7 @@ import {
   isQuotaError,
   isQuotaResponse,
   pickKeepaliveTarget,
+  MAX_PENDING_AGE_MS,
   parseResetAtMs,
   shouldContinue,
   zhipuResetAtMs,
@@ -156,8 +157,29 @@ export default Plugin.define({
     const heartbeatMs = Number(cfg.heartbeatMs ?? DEFAULT_HEARTBEAT_MS)
     const keepaliveOn = cfg.keepalive !== false && Number.isFinite(heartbeatMs) && heartbeatMs > 0
     dbg("[boot] setup:", String(ctx.location?.directory ?? ""), "heartbeatMs=", heartbeatMs, "keepalive=", keepaliveOn)
-    const activeExecutions = new Set<string>() // sid(活跃执行, 插入序 = 激活序)
-    const runningShells = new Map<string, string>() // shellID -> sid(插入序 = 启动序)
+    // sid -> 变为 pending 的时刻(=该执行的 started 时刻; 续命轮每轮重新 started, 自然刷新)
+    const activeExecutions = new Map<string, number>()
+    // shellID -> {sid, at: shell.started 时刻}
+    const runningShells = new Map<string, { sid: string; at: number }>()
+
+    // 陈旧条目剔除: 终态事件丢失时兜底(见 core.MAX_PENDING_AGE_MS 注释), 防永久保活。
+    const pruneStale = (now: number) => {
+      for (const [sid, at] of activeExecutions)
+        if (now - at > MAX_PENDING_AGE_MS) {
+          activeExecutions.delete(sid)
+          dbg("[keepalive] prune stale execution:", sid)
+        }
+      for (const [shellID, v] of runningShells)
+        if (now - v.at > MAX_PENDING_AGE_MS) {
+          runningShells.delete(shellID)
+          dbg("[keepalive] prune stale shell:", shellID, v.sid)
+        }
+    }
+
+    const dropSession = (sid: string) => {
+      activeExecutions.delete(sid)
+      for (const [shellID, v] of runningShells) if (v.sid === sid) runningShells.delete(shellID)
+    }
 
     const sendHeartbeat = (sid: string) => {
       const now = Date.now()
@@ -179,8 +201,21 @@ export default Plugin.define({
           // 单循环 sweeper: 每周期醒一次, 发失败记日志继续(下个周期重试), 不让坏 fiber 退出。
           while (true) {
             yield* Effect.sleep(heartbeatMs)
-            const target = pickKeepaliveTarget(activeExecutions, runningShells.values())
+            pruneStale(Date.now())
+            const target = pickKeepaliveTarget(activeExecutions.keys(), Array.from(runningShells.values(), (v) => v.sid))
             if (!target) continue
+            // 目标会话已被删除 → 剔除全部相关条目后跳过(不给死会话发标记; 每 sweep 一次 get, 成本可忽略)
+            const alive = yield* ctx.session
+              .get({ sessionID: target as any })
+              .pipe(
+                Effect.as(true),
+                Effect.catch(() => Effect.sync(() => false)),
+              )
+            if (!alive) {
+              dbg("[keepalive] target session gone:", target)
+              dropSession(target)
+              continue
+            }
             const ok = yield* sendHeartbeat(target).pipe(
               Effect.as(true),
               Effect.catch((err) =>
@@ -447,7 +482,7 @@ export default Plugin.define({
           lastFailure.delete(startedSid)
           lastFailureMessage.delete(startedSid)
           // 保活保护集: 执行活跃期间(含 retry 睡眠/question/permission/工具/subagent)记为 pending
-          activeExecutions.add(startedSid)
+          activeExecutions.set(startedSid, Date.now())
           return
         }
         if (type === "session.step.failed") {
@@ -473,7 +508,7 @@ export default Plugin.define({
           // 后台 shell 进入保护集(shell 事件只有带 sessionID 的才会发布)
           const shellSid = String(data.sessionID ?? "")
           const shellID = String(data.shell?.id ?? "")
-          if (shellSid && shellID) runningShells.set(shellID, shellSid)
+          if (shellSid && shellID) runningShells.set(shellID, { sid: shellSid, at: Date.now() })
           return
         }
         if (type === "session.shell.ended") {

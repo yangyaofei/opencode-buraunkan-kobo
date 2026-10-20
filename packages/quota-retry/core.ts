@@ -66,6 +66,11 @@ export const DEFAULT_BUFFER_MS = 10_000
 export const DEFAULT_QUOTA_CACHE_MS = 60_000
 // 长等待心跳默认间隔: 45 分钟(低于 opencode location 回收的 60 分钟 TTL, 留 15 分钟余量)
 export const DEFAULT_HEARTBEAT_MS = 45 * 60 * 1000
+// pending 条目(活跃执行/后台 shell)最大存活时间: 事件流推导没有宿主内存注册表的天然自清理,
+// 终态事件一旦丢失(断连/会话被删/插件重载错位)条目会永久残留 → 永久保活 + 每 45 分钟一条标记。
+// 超龄条目在 sweep 时剔除。连续续命轮每轮都有新的 execution.started(刷新时间戳), 不受影响;
+// 代价是超过 12h 的真实后台 shell 失去保护(dbg 有记录)——两害取其轻。
+export const MAX_PENDING_AGE_MS = 12 * 60 * 60 * 1000
 // 判定 429 是不是配额耗尽的默认正则(智谱+火山特征)
 export const DEFAULT_QUOTA_MATCH = 'AccountQuotaExceeded|usage quota|使用上限|限额将在|"code"\\s*:\\s*"1308"'
 // 判定"配额类响应"的默认状态码。1.x 写死 429; 2.0 起可由 provider.statuses 覆盖。
